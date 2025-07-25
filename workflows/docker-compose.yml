@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  # Production service
+  cv-sar-sr-production:
+    build:
+      context: ../
+      dockerfile: workflows/Dockerfile
+    image: cv-sar-sr:production
+    container_name: cv-sar-sr-prod
+    runtime: nvidia  # GPU support
+    environment:
+      # Production settings
+      - MAX_FILES=${MAX_FILES:-}  # Process all files
+      - USE_GPU_FFT=True
+      - MAX_WORKERS=4
+      - MIN_CROSS_POL_COHERENCE=0.95
+      - MIN_ENERGY_RATIO=0.95
+      # AWS S3 settings (optional)
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - S3_BUCKET=${S3_BUCKET:-}
+      - S3_INPUT_PREFIX=${S3_INPUT_PREFIX:-}
+      - S3_OUTPUT_PREFIX=${S3_OUTPUT_PREFIX:-}
+      - CLEANUP_AFTER_UPLOAD=${CLEANUP_AFTER_UPLOAD:-false}
+    volumes:
+      - ${LOCAL_INPUT_DIR:-./data/processed_1}:/app/data/processed_1:ro
+      - ${LOCAL_OUTPUT_DIR:-./output}:/app/output
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: python3 workflows/patch_extractor_production_final.py
+
+  # GPU test service
+  cv-sar-sr-gpu-test:
+    extends: cv-sar-sr-production
+    container_name: cv-sar-sr-gpu-test
+    environment:
+      - MAX_FILES=1
+      - USE_GPU_FFT=True
+    command: gpu-test
+
+  # CPU-only service (for non-GPU instances)
+  cv-sar-sr-cpu:
+    extends: cv-sar-sr-production
+    container_name: cv-sar-sr-cpu
+    runtime: runc  # No GPU
+    environment:
+      - USE_GPU_FFT=False
+      - MAX_WORKERS=2
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 16G
+
+  # Development service
+  cv-sar-sr-dev:
+    extends: cv-sar-sr-production
+    container_name: cv-sar-sr-dev
+    build:
+      context: ../
+      dockerfile: workflows/Dockerfile
+      target: development  # Multi-stage build
+    volumes:
+      - ../workflows:/app/workflows  # Mount source code
+      - ${LOCAL_INPUT_DIR:-./data/processed_1}:/app/data/processed_1:ro
+      - ${LOCAL_OUTPUT_DIR:-./output}:/app/output
+    environment:
+      - MAX_FILES=1
+      - PYTHONUNBUFFERED=1
+    command: bash
+
+  # Jupyter notebook service for analysis
+  cv-sar-sr-notebook:
+    extends: cv-sar-sr-production
+    container_name: cv-sar-sr-notebook
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    command: >
+      bash -c "pip install jupyterlab &&
+               jupyter lab --ip=0.0.0.0 --no-browser --allow-root"
+
+# Networks
+networks:
+  default:
+    name: cv-sar-network
+
+# Volumes
+volumes:
+  output:
+    driver: local
+  logs:
+    driver: local 

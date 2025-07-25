@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<graph id="Graph2_Patch">
+  <version>1.0</version>
+
+  <!-- 1) Read 1차 전처리 결과 -->
+  <node id="Read">
+    <operator>Read</operator>
+    <parameters>
+      <!-- run_graph2_patch.sh 에서 -SsourceProduct 로 주입 -->
+      <file>${sourceProduct}</file>
+    </parameters>
+  </node>
+
+  <!-- 2) TOPSAR Deburst -->
+  <node id="TOPSAR-Deburst">
+    <operator>TOPSAR-Deburst</operator>
+    <sources>
+      <sourceProduct refid="Read"/>
+    </sources>
+    <parameters>
+      <selectedPolarisations>VV,VH</selectedPolarisations>
+      <preserveBurstIndicators>false</preserveBurstIndicators>
+    </parameters>
+  </node>
+
+  <!-- 3) Subset: 한 개 패치 -->
+  <node id="Subset_Patch">
+    <operator>Subset</operator>
+    <sources>
+      <sourceProduct refid="TOPSAR-Deburst"/>
+    </sources>
+    <parameters>
+      <copyMetadata>true</copyMetadata>
+      <!-- startX, startY, patchWidth, patchHeight는 Bash 스크립트가 -P 로 주입 -->
+      <pixelRegion>${startX},${startY},${patchWidth},${patchHeight}</pixelRegion>
+    </parameters>
+  </node>
+
+  <!-- 4) Write -->
+  <node id="Write">
+    <operator>Write</operator>
+    <sources>
+      <sourceProduct refid="Subset_Patch"/>
+    </sources>
+    <parameters>
+      <formatName>BEAM-DIMAP</formatName>
+      <!-- 예: S1A_..._IW3_patch_0_0.dim -->
+      <file>${targetPath}</file>
+    </parameters>
+  </node>
+</graph>
