@@ -165,7 +165,7 @@ def export_training_curves(log_dir: str, output_dir: str = "plots"):
         plt.plot(val_steps, val_values, label='Validation Loss', color='red')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
-        plt.title('SAR Super-Resolution Training Loss')
+        plt.title('VV SAR Super-Resolution Training Loss')
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.yscale('log')
@@ -190,7 +190,7 @@ def export_training_curves(log_dir: str, output_dir: str = "plots"):
         plt.plot(val_steps, val_values, label='Validation PSNR', color='red')
         plt.xlabel('Epoch')
         plt.ylabel('PSNR (dB)')
-        plt.title('SAR Super-Resolution PSNR')
+        plt.title('VV SAR Super-Resolution PSNR')
         plt.legend()
         plt.grid(True, alpha=0.3)
         
