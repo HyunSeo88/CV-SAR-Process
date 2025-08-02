@@ -1,382 +1,213 @@
 #!/usr/bin/env python3
 """
-Anisotropic Complex Swin U-Net++ for Dual-Polarimetric SAR Super-Resolution
-===========================================================================
+Anisotropic Complex Swin U-Net++ (AC-Swin-UNet++)
+================================================
+Dual-polarimetric SAR 4-channel (VV-Re, VV-Im, VH-Re, VH-Im) super-resolution network.
 
-This script implements the AC-Swin-UNet++ architecture in PyTorch, specifically
-designed for super-resolving dual-polarimetric (VV, VH) complex SAR data.
+Key points vs. prototype version:
+1. 4-channel real I/O  → 내부 2-channel complex 전환.
+2. Shifted-window Swin Transformer(8×4) : 짝수 stage 시 cyclic shift = window/2.
+3. Dense skip(U-Net++), Complex SE + Spatial Attention, Complex PixelShuffle upsampling.
 
-Key Architectural Features:
-- Siamese Encoder: Shared-weight encoders process VV and VH polarizations in parallel,
-  using anisotropic complex convolutions (3x7 kernels, 1x2 strides).
-- Swin Transformer Bottleneck: A complex-valued Swin Transformer with anisotropic
-  windows (8x4) serves as the bottleneck to capture global dependencies.
-- Dense Skip Connections (U-Net++): All encoder feature maps are densely
-  connected to the decoder, improving gradient flow and feature fusion.
-- Advanced Decoder: The decoder uses Complex Pixel Shuffle for high-quality
-  upsampling and incorporates both Complex SE (Squeeze-and-Excitation) and
-  Complex Spatial Attention modules.
-- Input/Output: Takes a (B, 2, H, W) complex tensor and outputs a
-  (B, 2, H_hr, W_hr) complex tensor.
-
-NOTE: Coherence calculations are disabled as phase coherence between VV and VH
-in Sentinel-1 is typically low and not a reliable feature for this task.
+Input  : (B,4,H, W) real
+Output : (B,4,H,4·W) real (anisotropic 4× only in width, LR height 유지)
 """
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from typing import Optional, List, Tuple
+from typing import Tuple, List
 
-# --- Foundational Complex-Valued Modules ---
+# ================================================================
+# Basic complex layers
+# ================================================================
 
 class ComplexConv2d(nn.Module):
-    """Implements a complex-valued 2D convolution."""
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+    def __init__(self, in_ch: int, out_ch: int, k, s, p):
         super().__init__()
-        self.conv_r = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False)
-        self.conv_i = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False)
+        self.real = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False)
+        self.imag = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: complex tensor"""
-        real_out = self.conv_r(x.real) - self.conv_i(x.imag)
-        imag_out = self.conv_r(x.imag) + self.conv_i(x.real)
-        return torch.complex(real_out, imag_out)
+        r = self.real(x.real) - self.imag(x.imag)
+        i = self.real(x.imag) + self.imag(x.real)
+        return torch.complex(r, i)
+
+class ComplexBN(nn.Module):
+    def __init__(self, c: int):
+        super().__init__()
+        self.r = nn.BatchNorm2d(c)
+        self.i = nn.BatchNorm2d(c)
+
+    def forward(self, x: torch.Tensor):
+        return torch.complex(self.r(x.real), self.i(x.imag))
 
 class ComplexGELU(nn.Module):
-    """Applies GELU activation to the magnitude of a complex tensor."""
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        magnitude = torch.abs(x)
-        activated_magnitude = F.gelu(magnitude)
-        # Preserve phase, scale magnitude
-        return x * (activated_magnitude / (magnitude + 1e-8))
+    def forward(self, x: torch.Tensor):
+        mag = torch.abs(x)
+        return x * (F.gelu(mag) / (mag + 1e-8))
 
-class ComplexBatchNorm2d(nn.Module):
-    def __init__(self, num_features, eps=1e-5, momentum=0.1):
-        super().__init__()
-        self.bn_r = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum)
-        self.bn_i = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum)
-
-    def forward(self, x):
-        return torch.complex(self.bn_r(x.real), self.bn_i(x.imag))
-
-
-# --- Decoder and Attention Modules ---
-
-class ComplexPixelShuffle(nn.Module):
-    """
-    Complex-valued PixelShuffle for artifact-free upsampling.
-    This module first applies a convolution to expand channels, then performs
-    pixel shuffle on real and imaginary parts separately.
-    """
-    def __init__(self, in_channels, out_channels, scale_factor):
-        super().__init__()
-        self.scale_factor = scale_factor
-        self.conv = ComplexConv2d(in_channels, out_channels * (scale_factor ** 2), 1, 1, 0)
-        self.shuffle = nn.PixelShuffle(scale_factor)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        real = self.shuffle(x.real)
-        imag = self.shuffle(x.imag)
-        return torch.complex(real, imag)
+# ================================================================
+# Attention blocks
+# ================================================================
 
 class ComplexSE(nn.Module):
-    """Complex Squeeze-and-Excitation Module."""
-    def __init__(self, channels, reduction=16):
+    def __init__(self, c: int, r: int = 16):
         super().__init__()
-        # Operate on magnitude for pooling and excitation score generation
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // reduction, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, 1, bias=False),
-            nn.Sigmoid()
+            nn.Conv2d(c, c//r, 1, bias=False), nn.ReLU(inplace=True),
+            nn.Conv2d(c//r, c, 1, bias=False), nn.Sigmoid()
         )
+    def forward(self, x):
+        return x * self.se(torch.abs(x))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Get attention scores from magnitude
-        scale = self.se(torch.abs(x))
-        return x * scale
-
-class ComplexSpatialAttention(nn.Module):
-    """Complex Spatial Attention Module."""
-    def __init__(self, kernel_size=7):
+class ComplexSpatialAttn(nn.Module):
+    def __init__(self, k: int = 7):
         super().__init__()
-        # Use real-valued conv on concatenated magnitude, real, imag parts
-        self.conv = nn.Conv2d(3, 1, kernel_size, padding=kernel_size//2, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        self.conv = nn.Conv2d(3, 1, k, padding=k//2, bias=False)
+    def forward(self, x):
+        feat = torch.cat([torch.abs(x), x.real, x.imag], 1)
+        m = torch.sigmoid(self.conv(feat))
+        return x * m
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Stack magnitude, real, and imag parts along channel dimension
-        cat_features = torch.cat([torch.abs(x), x.real, x.imag], dim=1)
-        # Generate spatial attention map
-        attn_map = self.sigmoid(self.conv(cat_features))
-        return x * attn_map
+# ================================================================
+# Encoder / Decoder blocks
+# ================================================================
 
-
-# --- Encoder and Decoder Blocks ---
-
-class EncoderBlock(nn.Module):
-    """Siamese Encoder Block with anisotropic convolution."""
+class EncBlock(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
-        # Anisotropic convolution as specified
-        self.conv = ComplexConv2d(in_c, out_c, kernel_size=(3, 7), stride=(1, 2), padding=(1, 3))
-        self.bn = ComplexBatchNorm2d(out_c)
-        self.act = ComplexGELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.conv = ComplexConv2d(in_c, out_c, (3,7), (1,2), (1,3))
+        self.bn   = ComplexBN(out_c)
+        self.act  = ComplexGELU()
+    def forward(self,x):
         return self.act(self.bn(self.conv(x)))
 
-class DecoderBlock(nn.Module):
-    """
-    U-Net++ style dense decoder block with attention.
-    Receives a list of tensors from skip connections and the upsampled path.
-    """
-    def __init__(self, in_c, out_c, upsample_scale=2):
+class DecBlock(nn.Module):
+    def __init__(self, in_c, out_c, scale=2):
         super().__init__()
-        self.upsample = ComplexPixelShuffle(in_c, out_c, upsample_scale)
-        self.conv1 = ComplexConv2d(out_c * 2, out_c, 3, 1, 1) # After concat
-        self.bn1 = ComplexBatchNorm2d(out_c)
-        self.act1 = ComplexGELU()
-        self.conv2 = ComplexConv2d(out_c, out_c, 3, 1, 1)
-        self.bn2 = ComplexBatchNorm2d(out_c)
-        self.act2 = ComplexGELU()
-        
-        self.se = ComplexSE(out_c)
-        self.spatial_attn = ComplexSpatialAttention()
-
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x_up = self.upsample(x)
-        x_cat = torch.cat([x_up, skip], dim=1)
-        
-        x = self.act1(self.bn1(self.conv1(x_cat)))
-        x = self.act2(self.bn2(self.conv2(x)))
-        
-        x = self.se(x)
-        x = self.spatial_attn(x)
+        self.up   = ComplexPixelShuffle(in_c, out_c, scale)
+        self.c1   = ComplexConv2d(out_c*2, out_c, 3,1,1)
+        self.b1   = ComplexBN(out_c)
+        self.c2   = ComplexConv2d(out_c, out_c, 3,1,1)
+        self.b2   = ComplexBN(out_c)
+        self.act  = ComplexGELU()
+        self.se   = ComplexSE(out_c)
+        self.sa   = ComplexSpatialAttn()
+    def forward(self,x,skip):
+        x = self.up(x)
+        x = torch.cat([x,skip],1)
+        x = self.act(self.b1(self.c1(x)))
+        x = self.act(self.b2(self.c2(x)))
+        x = self.sa(self.se(x))
         return x
 
+# ================================================================
+# Swin transformer (complex)
+# ================================================================
 
-# --- Swin Transformer Bottleneck ---
-
-class ComplexSwinAttention(nn.Module):
-    """Complex Multi-Head Self-Attention for Swin Transformer."""
-    def __init__(self, dim, num_heads, window_size):
+class ComplexWindowAttn(nn.Module):
+    def __init__(self, dim:int, heads:int, win:Tuple[int,int]):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.window_size = window_size
+        self.dim, self.heads = dim, heads
+        self.scale = (dim//heads)**-0.5
+        self.win = win
+        self.qkv = ComplexConv2d(dim, dim*3, 1,1,0)
+        self.proj= ComplexConv2d(dim, dim, 1,1,0)
+        # relative position bias (real-valued) – kept simple
+        self.rel = nn.Parameter(torch.zeros(heads, (2*win[0]-1)*(2*win[1]-1)))
+        idxs = torch.stack(torch.meshgrid(torch.arange(win[0]),torch.arange(win[1]),indexing='ij')).view(2,-1)
+        rel = idxs[:, :,None]-idxs[:,None,:]
+        rel[0]+=win[0]-1; rel[1]+=win[1]-1
+        rel[0]*=2*win[1]-1
+        self.register_buffer('rel_idx',(rel[0]+rel[1]).long())
+    def forward(self,x):
+        B,C,H,W = x.shape
+        q,k,v = torch.chunk(self.qkv(x),3,1)
+        q = rearrange(q,'b (h d) hh ww -> b h (hh ww) d',h=self.heads)
+        k = rearrange(k,'b (h d) hh ww -> b h (hh ww) d',h=self.heads)
+        v = rearrange(v,'b (h d) hh ww -> b h (hh ww) d',h=self.heads)
+        attn = (q@k.transpose(-2,-1).conj())*self.scale
+        bias = self.rel[:,self.rel_idx.view(-1)].view(self.heads,*self.rel_idx.shape)
+        attn = attn + bias.unsqueeze(0)
+        w = torch.softmax(torch.abs(attn),-1)
+        attn = attn*(w/(torch.abs(attn)+1e-8))
+        out = attn@v
+        out = rearrange(out,'b h (hh ww) d -> b (h d) hh ww',hh=self.win[0],ww=self.win[1])
+        return self.proj(out)
 
-        self.qkv_conv = ComplexConv2d(dim, dim * 3, 1, 1, 0)
-        self.proj_conv = ComplexConv2d(dim, dim, 1, 1, 0)
-        
-        # Relative position bias
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))
-        coords_h = torch.arange(self.window_size[0])
-        coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing="ij"))
-        coords_flatten = torch.flatten(coords, 1)
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
-        relative_coords[:, :, 0] += self.window_size[0] - 1
-        relative_coords[:, :, 1] += self.window_size[1] - 1
-        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
-        relative_position_index = relative_coords.sum(-1)
-        self.register_buffer("relative_position_index", relative_position_index)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        qkv = self.qkv_conv(x)
-        q, k, v = torch.chunk(qkv, 3, dim=1) # (B, C, H, W)
-
-        # Reshape for multi-head attention
-        q = rearrange(q, 'b (h d) hh ww -> b h (hh ww) d', h=self.num_heads)
-        k = rearrange(k, 'b (h d) hh ww -> b h (hh ww) d', h=self.num_heads)
-        v = rearrange(v, 'b (h d) hh ww -> b h (hh ww) d', h=self.num_heads)
-
-        # Complex dot product attention
-        attn = (q @ k.transpose(-2, -1).conj()) * self.scale
-        
-        # Apply relative position bias to magnitude
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-        attn = attn + relative_position_bias.unsqueeze(0)
-
-        # Softmax on magnitude
-        attn_mag = torch.softmax(torch.abs(attn), dim=-1)
-        attn = attn * (attn_mag / (torch.abs(attn) + 1e-8))
-
-        out = attn @ v
-        out = rearrange(out, 'b h (hh ww) d -> b (h d) hh ww', hh=H, ww=W)
-        return self.proj_conv(out)
-
-class SwinTransformerBlock(nn.Module):
-    """Anisotropic Complex Swin Transformer Block."""
-    def __init__(self, dim, num_heads, window_size=(8, 4)):
+class SwinBlock(nn.Module):
+    def __init__(self,dim,heads,win=(8,4),shift:bool=False):
         super().__init__()
-        self.window_size = window_size
-        self.attention = ComplexSwinAttention(dim, num_heads, window_size)
-        self.norm1 = ComplexBatchNorm2d(dim)
-        self.norm2 = ComplexBatchNorm2d(dim)
-        
-        # Complex MLP
-        self.mlp = nn.Sequential(
-            ComplexConv2d(dim, dim * 4, 1, 1, 0),
-            ComplexGELU(),
-            ComplexConv2d(dim * 4, dim, 1, 1, 0)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        
-        # Window Partitioning
-        windows = rearrange(x, 'b c (h p1) (w p2) -> (b h w) c p1 p2', p1=self.window_size[0], p2=self.window_size[1])
-        
-        # Attention in windows
-        attn_windows = self.attention(windows)
-        
-        # Reverse Window Partitioning
-        attn_output = rearrange(attn_windows, '(b h w) c p1 p2 -> b c (h p1) (w p2)', h=H//self.window_size[0], w=W//self.window_size[1])
-        
-        # Skip connection 1
-        x = x + attn_output
-        x = self.norm1(x)
-
-        # MLP
-        mlp_output = self.mlp(x)
-
-        # Skip connection 2
-        x = x + mlp_output
-        x = self.norm2(x)
+        self.win,self.shift=win,shift
+        self.attn = ComplexWindowAttn(dim,heads,win)
+        self.n1 = ComplexBN(dim); self.n2 = ComplexBN(dim)
+        self.mlp= nn.Sequential(ComplexConv2d(dim,dim*4,1,1,0),ComplexGELU(),ComplexConv2d(dim*4,dim,1,1,0))
+    def forward(self,x):
+        B,C,H,W = x.shape
+        if self.shift:
+            x = torch.roll(x, shifts=(-self.win[0]//2, -self.win[1]//2), dims=(2,3))
+        # partition
+        assert H%self.win[0]==0 and W%self.win[1]==0, "Input size must be multiple of window"
+        x_ = rearrange(x,'b c (h p1) (w p2)-> (b h w) c p1 p2',p1=self.win[0],p2=self.win[1])
+        x_ = self.attn(x_)
+        x_ = rearrange(x_,'(b h w) c p1 p2 -> b c (h p1) (w p2)',h=H//self.win[0],w=W//self.win[1])
+        if self.shift:
+            x_ = torch.roll(x_, shifts=(self.win[0]//2, self.win[1]//2), dims=(2,3))
+        x = self.n1(x+x_)
+        x = self.n2(x+self.mlp(x))
         return x
 
-
-# --- Main Model: AC-Swin-UNet++ ---
+# ================================================================
+# Main Network
+# ================================================================
 
 class ACSwinUNetPP(nn.Module):
-    def __init__(self, in_channels=1, base_dim=64, num_heads=4, swin_depth=2):
+    def __init__(self, base_dim:int=64, heads:int=4, depth:int=2):
         super().__init__()
-        
-        # --- Siamese Encoder ---
-        self.enc1 = EncoderBlock(in_channels, base_dim) # 64
-        self.enc2 = EncoderBlock(base_dim, base_dim*2) # 128
-        self.enc3 = EncoderBlock(base_dim*2, base_dim*4) # 256
-        
-        # --- Bottleneck ---
-        self.bottleneck = nn.Sequential(
-            *[SwinTransformerBlock(dim=base_dim*4, num_heads=num_heads, window_size=(8,4)) for _ in range(swin_depth)]
+        # 4-real → 2-complex helper handled in forward
+        self.enc1 = EncBlock(2, base_dim)
+        self.enc2 = EncBlock(base_dim, base_dim*2)
+        self.enc3 = EncBlock(base_dim*2, base_dim*4)
+        blocks: List[nn.Module] = []
+        for i in range(depth):
+            blocks.append(SwinBlock(base_dim*4, heads, win=(8,4), shift=(i%2==1)))
+        self.bottleneck = nn.Sequential(*blocks)
+        self.dec2 = DecBlock(base_dim*4, base_dim*2)
+        self.dec1 = DecBlock(base_dim*2, base_dim)
+        self.final = nn.Sequential(
+            ComplexConv2d(base_dim, base_dim//2,3,1,1), ComplexGELU(),
+            ComplexConv2d(base_dim//2,2,1,1,0)
         )
-        
-        # --- U-Net++ Dense Decoder Path ---
-        # Note: This is a simplified U-Net++ structure for clarity.
-        # A full implementation would have more cross-connections.
-        self.dec2 = DecoderBlock(base_dim*4, base_dim*2)
-        self.dec1 = DecoderBlock(base_dim*2, base_dim)
-        
-        # Final output layer
-        self.final_conv = nn.Sequential(
-            ComplexConv2d(base_dim, base_dim//2, 3, 1, 1),
-            ComplexGELU(),
-            ComplexConv2d(base_dim//2, in_channels, 1, 1, 0)
-        )
-        
-        # Upsampling for residual connection
-        self.final_upsample = nn.Upsample(scale_factor=(1, 4), mode='bilinear', align_corners=False)
-
-        print(f"AC-Swin-UNet++ initialized with {self.count_parameters():,} parameters.")
-
-    def count_parameters(self):
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x is a dual-polar complex tensor (B, 2, H, W)"""
-        # Split polarizations for Siamese processing
-        vv, vh = x[:, 0:1, ...], x[:, 1:2, ...]
-        
-        # --- Encoder Path (Shared Weights) ---
-        vv_e1 = self.enc1(vv)
-        vh_e1 = self.enc1(vh) # Share weights
-
-        vv_e2 = self.enc2(vv_e1)
-        vh_e2 = self.enc2(vh_e1)
-
-        vv_e3 = self.enc3(vv_e2)
-        vh_e3 = self.enc3(vh_e2)
-        
-        # Combine features before bottleneck
-        b_in = vv_e3 + vh_e3 # Element-wise sum fusion
-        
-        # --- Bottleneck ---
-        b_out = self.bottleneck(b_in)
-        
-        # --- Decoder Path ---
-        # Using vv channel for skip connections as it's the primary channel to be super-resolved
-        d2 = self.dec2(b_out, vv_e2)
-        d1 = self.dec1(d2, vv_e1)
-
-        # --- Final Output Generation ---
-        # Generate SR for both channels from the fused features
-        final_features = self.final_conv(d1)
-        
-        # Residual connection
-        residual_vv = self.final_upsample(vv.real) + 1j * self.final_upsample(vv.imag)
-        residual_vh = self.final_upsample(vh.real) + 1j * self.final_upsample(vh.imag)
-        
-        out_vv = final_features + residual_vv
-        out_vh = final_features + residual_vh # Simple assumption: residual is similar
-        
-        return torch.cat([out_vv, out_vh], dim=1)
+    def _real4_to_c2(self,x:torch.Tensor):
+        vv = torch.complex(x[:,0],x[:,1]); vh = torch.complex(x[:,2],x[:,3])
+        return torch.stack([vv,vh],1)
+    def _c2_to_real4(self,x:torch.Tensor):
+        vv,vh = x[:,0],x[:,1]
+        return torch.stack([vv.real,vv.imag,vh.real,vh.imag],1)
+    def forward(self, x: torch.Tensor):
+        c = self._real4_to_c2(x)
+        e1 = self.enc1(c)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        b  = self.bottleneck(e3)
+        d2 = self.dec2(b, e2)
+        d1 = self.dec1(d2, e1)
+        out = self.final(d1)
+        out = out + F.interpolate(c, size=out.shape[-2:], mode='bilinear', align_corners=False)
+        return self._c2_to_real4(out)
 
 
 def create_model():
-    """Factory function for train.py"""
-    # NOTE: Set torch.backends.cudnn.benchmark = True in your training script for performance.
-    return ACSwinUNetPP(in_channels=1, base_dim=64, num_heads=4, swin_depth=2)
+    return ACSwinUNetPP()
 
-
-if __name__ == '__main__':
-    print("--- Testing AC-Swin-UNet++ ---")
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # Target memory: RTX 4070 Ti (12GB)
-    # Using a smaller batch size for testing to be safe.
-    # Dynamic batch sizing from speed_utils.py should handle this in train.py
-    batch_size = 2
-    in_height, in_width = 128, 64 # Example LR dimensions
-    
-    model = create_model().to(device)
-    
-    # Create a dummy complex input tensor
-    dummy_input = torch.randn(batch_size, 2, in_height, in_width, dtype=torch.cfloat).to(device)
-    
-    print(f"Device: {device}")
-    print(f"Input shape: {dummy_input.shape}")
-    
+if __name__ == "__main__":
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    m = create_model().to(dev).half()
+    x = torch.randn(2,4,64,128,device=dev,dtype=torch.float16)
     with torch.no_grad():
-        output = model(dummy_input)
-    
-    # Expected output shape: (B, 2, H, W*4) due to strides (1,2) and upsampling (1,4)
-    print(f"Output shape: {output.shape}")
-    print(f"Output is complex: {torch.is_complex(output)}")
-    
-    # --- Performance Metrics To Be Integrated ---
-    print("\n--- Metrics to integrate in utils.py ---")
-    print(" - PSNR (Peak Signal-to-Noise Ratio)")
-    print(" - RMSE (Root Mean Squared Error)")
-    print(" - CPIF (Complex Phase Invariant Fidelity)")
-    
-    # --- Notes on Disabled Functionality ---
-    print("\n--- Disabled/Removed Functionality ---")
-    print(" - Coherence calculation between VV and VH is removed due to low reliability.")
-
-    # --- Potential Future Optimizations ---
-    print("\n--- Future Optimization Points ---")
-    print(" - Swin Transformer Depth: `swin_depth` can be adjusted. More depth increases capacity but also memory/compute.")
-    print(" - Attention Mechanism: The fusion of VV and VH features in the decoder could be more sophisticated (e.g., cross-attention).")
-    print(" - Mixed Precision: Use torch.amp for further speed-up and memory savings.")
-
+        y = m(x)
+    print('out',y.shape)

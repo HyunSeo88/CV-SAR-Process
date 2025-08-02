@@ -4,7 +4,8 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 # PERF: Helper to detect optimal number of DataLoader workers
 def get_optimal_workers():
-    return os.cpu_count() * 2 if os.cpu_count() else 4  # Fallback to 4 if detection fails
+    cpu = os.cpu_count() or 4
+    return min(cpu, 8)  # Fallback to 4 if detection fails
 
 # PERF: Auto-adjust batch size based on GPU memory headroom
 def auto_adjust_batch_size(initial_batch_size, headroom_threshold=2 * 1024 * 1024 * 1024):  # 2 GB
@@ -17,7 +18,12 @@ def auto_adjust_batch_size(initial_batch_size, headroom_threshold=2 * 1024 * 102
     return initial_batch_size
 
 # PERF: Setup profiler for a given number of steps
-def setup_profiler(steps=50, output_file='runs/profile.json'):
+import datetime
+
+def setup_profiler(steps=50, output_file=None):
+    if output_file is None:
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_file = f'runs/profile_{ts}.json'
     return profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=torch.profiler.schedule(wait=1, warmup=1, active=steps, repeat=1),

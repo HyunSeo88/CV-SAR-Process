@@ -19,6 +19,21 @@ import math
 import torchvision.models as models
 from typing import Optional
 
+def _ensure_complex(t: torch.Tensor) -> torch.Tensor:
+    """Convert 4-channel real tensor → 2-channel complex tensor if needed."""
+    if torch.is_complex(t):
+        return t
+    if t.shape[1] == 4:
+        vv = torch.complex(t[:,0], t[:,1])
+        vh = torch.complex(t[:,2], t[:,3])
+        return torch.stack([vv, vh], 1)
+    if t.shape[1] == 2:
+        vv = torch.complex(t[:,0], t[:,1])
+        vh = torch.complex(t[:,1], t[:,0])  # Dummy second channel
+        return torch.stack([vv, vh], 1)
+    raise RuntimeError("Tensor shape not compatible with complex conversion")
+
+
 class PerceptualLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -64,6 +79,7 @@ def sr_loss(recon: torch.Tensor, gt: torch.Tensor, perceptual: nn.Module = None,
     Returns:
         dict: Dictionary containing total loss and its components.
     """
+    recon, gt = _ensure_complex(recon), _ensure_complex(gt)
     # 1. Amplitude Loss (MSE)
     amp_loss = F.mse_loss(torch.abs(recon), torch.abs(gt))
     
@@ -105,12 +121,14 @@ def complex_l1_loss(recon, gt):
 
 def calculate_rmse(recon: torch.Tensor, gt: torch.Tensor) -> float:
     """Calculate Root Mean Squared Error on the amplitude."""
+    recon, gt = _ensure_complex(recon), _ensure_complex(gt)
     recon_amp = torch.abs(recon)
     gt_amp = torch.abs(gt)
     return torch.sqrt(F.mse_loss(recon_amp, gt_amp)).item()
 
 
 def calculate_psnr(recon: torch.Tensor, gt: torch.Tensor, max_val: Optional[float] = None) -> float:
+    recon, gt = _ensure_complex(recon), _ensure_complex(gt)
     """Calculate Peak Signal-to-Noise Ratio for amplitude. Assumes complex inputs."""
     recon_amp = torch.abs(recon)
     gt_amp = torch.abs(gt)
@@ -129,6 +147,7 @@ def calculate_psnr(recon: torch.Tensor, gt: torch.Tensor, max_val: Optional[floa
 
 def calculate_ssim(recon: torch.Tensor, gt: torch.Tensor, window_size=11, sigma=1.5) -> float:
     """Calculate Structural Similarity Index for amplitude. Assumes complex inputs."""
+    recon, gt = _ensure_complex(recon), _ensure_complex(gt)
     recon_amp = torch.abs(recon)
     gt_amp = torch.abs(gt)
     
@@ -154,6 +173,7 @@ def calculate_ssim(recon: torch.Tensor, gt: torch.Tensor, window_size=11, sigma=
 
 
 def calculate_cpif(recon: torch.Tensor, gt: torch.Tensor, reduction: str = 'mean') -> torch.Tensor:
+    recon, gt = _ensure_complex(recon), _ensure_complex(gt)
     """
     Calculate Complex Peak Intensity Factor. Assumes complex inputs.
     """

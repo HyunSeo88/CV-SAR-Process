@@ -37,8 +37,7 @@ from torch import amp
 autocast = amp.autocast
 GradScaler = amp.GradScaler
 
-# Import our modules
-from ac_swin_unet_pp import create_model
+# Import utils always
 from utils import sr_loss, MetricsCalculator, PerceptualLoss
 from data_cache import load_or_compute_lr
 # PERF: Import speed utils
@@ -230,10 +229,15 @@ class SARSuperResDataset(Dataset):
         else:
             lr_data = self._simulate_lr_from_hr(hr_data)
         
-        # Return complex tensors directly
-        lr_tensor = torch.from_numpy(lr_data).cfloat()
-        hr_tensor = torch.from_numpy(hr_data).cfloat()
-        
+        # Convert complex to 4 real-channel tensor [VV-Re, VV-Im, VH-Re, VH-Im]
+        lr_tensor = torch.from_numpy(np.stack([
+            lr_data[0].real, lr_data[0].imag,
+            lr_data[1].real, lr_data[1].imag
+        ], axis=0)).float()
+        hr_tensor = torch.from_numpy(np.stack([
+            hr_data[0].real, hr_data[0].imag,
+            hr_data[1].real, hr_data[1].imag
+        ], axis=0)).float()
         return lr_tensor, hr_tensor
 
     def fetch_raw_patch(self, idx):
@@ -569,6 +573,7 @@ def train_model(
     early_stop_patience: int = 7,
     early_stop_threshold: float = 1e-4,
     enable_tensorboard: bool = True,
+    enable_perceptual: bool = True,
     tensorboard_log_dir: str = None,
     profile_steps: int = 0,  # PERF: Added for profiling control
     *,
@@ -607,12 +612,12 @@ def train_model(
     model = create_model()
     model.to(device)
     
-    # FIX: Instantiate PerceptualLoss once and pass to epoch functions
-    perceptual = PerceptualLoss().to(device)
+    # Instantiate PerceptualLoss only when enabled
+    perceptual = PerceptualLoss().to(device) if enable_perceptual else None
     
     # Log model architecture to TensorBoard
     if writer:
-        dummy_input = torch.randn(1, 3, 64, 128).to(device) # Adjusted dummy input to match real-valued shape
+        dummy_input = torch.randn(1, 4, 64, 128).to(device) # Adjusted dummy input to match real-valued shape
         
         try:
             writer.add_graph(model, dummy_input)
@@ -715,6 +720,8 @@ def train_model(
                 writer.add_scalar('Loss/Val', val_loss, epoch)
                 writer.add_scalar('PSNR/Train', train_avg_metrics.get('psnr', 0), epoch)
                 writer.add_scalar('PSNR/Val', val_avg_metrics.get('psnr', 0), epoch)
+                writer.add_scalar('RMSE/Val', val_avg_metrics.get('rmse', 0), epoch)
+                writer.add_scalar('CPIF/Val', val_avg_metrics.get('cpif', 0), epoch)
                 writer.add_scalar('Learning_Rate', current_lr, epoch)
                 
                 # Log images
@@ -853,6 +860,10 @@ if __name__ == "__main__":
     parser.add_argument('--gpu-degrade', action='store_true', help="Run HR→LR degradation on GPU")
     parser.add_argument('--no-cache', action='store_true', help="Disable LR patch caching")
     parser.add_argument('--num-workers', type=int, default=0, help="DataLoader num_workers (default 0)")
+    parser.add_argument('--model-type', default='swin', choices=['swin','base'], help='Model backbone selection')
+    parser.add_argument('--dry-run', action='store_true', help='Run single forward pass and exit')
+    parser.add_argument('--no-perceptual', action='store_true', help='Disable perceptual VGG loss')
+    parser.add_argument('--auto-workers', action='store_true', help='Use optimal DataLoader workers automatically')
     args = parser.parse_args()
 
     # Set multiprocessing start method to avoid CUDA init deadlocks
@@ -862,6 +873,15 @@ if __name__ == "__main__":
         # Start method already set
         pass
     
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Select backbone at runtime
+    if args.model_type == 'swin':
+        from ac_swin_unet_pp import create_model as create_model_fn
+    else:
+        from cv_unet import create_model as create_model_fn
+    globals()['create_model'] = create_model_fn
+
     # Configuration
     config = {
         'data_dir': r"D:\Sentinel-1\data\processed_2",
@@ -874,8 +894,9 @@ if __name__ == "__main__":
         'enable_tensorboard': True,
         'use_cache': not args.no_cache,
         'gpu_degrade': args.gpu_degrade,
-        'num_workers': args.num_workers,
-        'tensorboard_log_dir': None  # Will use timestamped directory
+        'num_workers': get_optimal_workers() if args.auto_workers else args.num_workers,
+        'tensorboard_log_dir': None,  # Will use timestamped directory
+        'enable_perceptual': not args.no_perceptual
     }
     
     # PERF: Auto-adjust batch size if flag set
@@ -883,6 +904,14 @@ if __name__ == "__main__":
         config['batch_size'] = auto_adjust_batch_size(config['batch_size'])
         print(f"Auto-adjusted batch size to {config['batch_size']}")
     
+    if args.dry_run:
+        model = create_model_fn().to(device)
+        dummy = torch.randn(2,4,64,128,device=device)
+        with torch.no_grad():
+            out = model(dummy)
+        print("Header  |  PSNR  |  RMSE  |  CPIF")
+        exit(0)
+
     print("Complex U-Net SAR Super-Resolution Training")
     print("=" * 50)
     print("Configuration:")
