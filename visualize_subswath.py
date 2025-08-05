@@ -13,8 +13,6 @@ and save the final ground truth vs. super-resolved images for comparison.
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from pathlib import Path
 import argparse
 import sys
@@ -23,157 +21,16 @@ import re
 import cv2
 from scipy.ndimage import median_filter
 import matplotlib.pyplot as plt
-from typing import Tuple
-from einops import rearrange
 
 # Add model directory to path to import model components
 sys.path.append('./model')
 try:
-    from ac_swin_unet_pp import (create_model as create_swin_model, 
-                                ComplexConv2d, ComplexBN, ComplexGELU, 
-                                ComplexSE, SpatialAttention, ACCSwinUNetPP,
-                                ComplexWindowAttn, MLP)
-    from train import SARSuperResDataset  # Re-used for its LR degradation logic
+    from ac_swin_unet_pp import create_model as create_swin_model
+    # from train import SARSuperResDataset  # Re-used for its LR degradation logic - not needed for visualization
 except ImportError as e:
-    print(f"Error: Could not import model components. Make sure 'ac_swin_unet_pp.py' and 'train.py' are in the './model' directory.")
+    print(f"Error: Could not import model components. Make sure 'ac_swin_unet_pp.py' is in the './model' directory.")
     print(f"Details: {e}")
     sys.exit(1)
-
-# Legacy SwinBlock for checkpoint compatibility
-class LegacySwinBlock(nn.Module):
-    """Legacy version without stride parameter for compatibility with older checkpoints."""
-    def __init__(self, dim: int, depth: int, num_heads: int, win: Tuple[int, int] = (8, 4)):
-        super().__init__()
-        self.depth = depth
-        self.layers = nn.ModuleList([
-            nn.ModuleList([
-                ComplexWindowAttn(dim=dim, num_heads=num_heads, 
-                                window_size=win, shift=(win[0] // 2, win[1] // 2) if i % 2 == 1 else (0, 0)),
-                MLP(dim, dim * 4, act_layer=ComplexGELU),
-            ]) for i in range(depth)
-        ])
-        self.norm = ComplexBN(dim)
-
-    def forward(self, x):
-        for attn, mlp in self.layers:
-            x = x + attn(x)
-            x = x + mlp(x)
-        return self.norm(x)
-
-def create_swin_model_legacy():
-    """Create a legacy model compatible with older checkpoints."""
-    return ACCSwinUNetPP_Legacy()
-
-class ACCSwinUNetPP_Legacy(nn.Module):
-    """Legacy model without stride parameters for checkpoint compatibility."""
-    def __init__(self):
-        super().__init__()
-        # 인코더
-        self.stem = nn.Sequential(
-            ComplexConv2d(2, 64, k=7, s=1, p=3),
-            ComplexBN(64),
-            ComplexGELU()
-        )
-        
-        # 다운샘플링 블록들
-        self.down1 = nn.Sequential(
-            ComplexConv2d(64, 128, k=3, s=2, p=1),
-            ComplexBN(128),
-            ComplexGELU()
-        )
-        self.down2 = nn.Sequential(
-            ComplexConv2d(128, 256, k=3, s=2, p=1),
-            ComplexBN(256),
-            ComplexGELU()
-        )
-        self.down3 = nn.Sequential(
-            ComplexConv2d(256, 512, k=3, s=2, p=1),
-            ComplexBN(512),
-            ComplexGELU()
-        )
-        
-        # Swin Transformer 블록들 - legacy version without stride
-        self.swin1 = LegacySwinBlock(128, depth=2, num_heads=4, win=(16, 8))
-        self.swin2 = LegacySwinBlock(256, depth=2, num_heads=8, win=(16, 8))
-        self.swin3 = LegacySwinBlock(512, depth=6, num_heads=16, win=(16, 8))
-        self.swin4 = LegacySwinBlock(512, depth=2, num_heads=16, win=(16, 8))  # 병목 구간
-        
-        # Attention 모듈들
-        self.se1 = ComplexSE(128, r=8)
-        self.se2 = ComplexSE(256, r=8)
-        self.se3 = ComplexSE(512, r=8)
-        self.sa1 = SpatialAttention()
-        self.sa2 = SpatialAttention()
-        self.sa3 = SpatialAttention()
-        
-        # U-Net++ 스킵 연결들
-        self.skip_conv_0_1 = ComplexConv2d(128, 64, k=1, s=1, p=0)
-        self.skip_conv_1_1 = ComplexConv2d(256, 128, k=1, s=1, p=0)
-        self.skip_conv_2_1 = ComplexConv2d(512, 256, k=1, s=1, p=0)
-        self.skip_conv_0_2 = ComplexConv2d(128, 64, k=1, s=1, p=0)
-        self.skip_conv_1_2 = ComplexConv2d(256, 128, k=1, s=1, p=0)
-        self.skip_conv_0_3 = ComplexConv2d(128, 64, k=1, s=1, p=0)
-        
-        # 업샘플링 블록들
-        self.up1 = ComplexConv2d(512, 256, k=3, s=1, p=1)
-        self.up2 = ComplexConv2d(256, 128, k=3, s=1, p=1)
-        self.up3 = ComplexConv2d(128, 64, k=3, s=1, p=1)
-        
-        # 최종 출력 레이어
-        self.out_conv = ComplexConv2d(64, 1, k=3, s=1, p=1)
-        
-        # 4배 업스케일링을 위한 픽셀 셔플
-        self.pixel_shuffle = ComplexPixelShuffle(4)
-
-    def forward(self, x):
-        # 4채널 실수 → 2채널 복소수
-        x_complex = torch.complex(x[:, :2], x[:, 2:])
-        
-        # 인코더
-        x0 = self.stem(x_complex)
-        x1 = self.down1(x0)
-        x1 = self.swin1(x1)
-        x1 = self.se1(x1) * x1
-        x1 = self.sa1(torch.abs(x1)).unsqueeze(2) * x1
-        
-        x2 = self.down2(x1)
-        x2 = self.swin2(x2)
-        x2 = self.se2(x2) * x2
-        x2 = self.sa2(torch.abs(x2)).unsqueeze(2) * x2
-        
-        x3 = self.down3(x2)
-        x3 = self.swin3(x3)
-        x3 = self.se3(x3) * x3
-        x3 = self.sa3(torch.abs(x3)).unsqueeze(2) * x3
-        
-        # 병목 구간
-        x4 = self.swin4(x3)
-        
-        # 디코더 (U-Net++ 스타일)
-        x3_1 = F.interpolate(x4.view(x4.shape[0], -1, x4.shape[2], x4.shape[3]), 
-                            scale_factor=2, mode='bilinear', align_corners=False)
-        x3_1 = x3_1.view(x4.shape[0], x4.shape[1], x3_1.shape[2], x3_1.shape[3])
-        x3_1 = torch.complex(x3_1.real, x3_1.imag)
-        x3_1 = self.up1(x3_1) + self.skip_conv_2_1(x3)
-        
-        x2_1 = F.interpolate(x3_1.view(x3_1.shape[0], -1, x3_1.shape[2], x3_1.shape[3]), 
-                            scale_factor=2, mode='bilinear', align_corners=False)
-        x2_1 = x2_1.view(x3_1.shape[0], x3_1.shape[1], x2_1.shape[2], x2_1.shape[3])
-        x2_1 = torch.complex(x2_1.real, x2_1.imag)
-        x2_1 = self.up2(x2_1) + self.skip_conv_1_1(x2)
-        
-        x1_1 = F.interpolate(x2_1.view(x2_1.shape[0], -1, x2_1.shape[2], x2_1.shape[3]), 
-                            scale_factor=2, mode='bilinear', align_corners=False)
-        x1_1 = x1_1.view(x2_1.shape[0], x2_1.shape[1], x1_1.shape[2], x1_1.shape[3])
-        x1_1 = torch.complex(x1_1.real, x1_1.imag)
-        x1_1 = self.up3(x1_1) + self.skip_conv_0_1(x1)
-        
-        # 최종 출력
-        out = self.out_conv(x1_1)
-        out = self.pixel_shuffle(out)
-        
-        # 2채널 복소수 → 4채널 실수
-        return torch.cat([out.real, out.imag], dim=1)
 
 class SARImageAnalyzer:
     """
