@@ -7,14 +7,15 @@ def get_optimal_workers():
     cpu = os.cpu_count() or 4
     return min(cpu, 8)  # Fallback to 4 if detection fails
 
-# PERF: Auto-adjust batch size based on GPU memory headroom
-def auto_adjust_batch_size(initial_batch_size, headroom_threshold=2 * 1024 * 1024 * 1024):  # 2 GB
+# PERF: Auto-adjust batch size based on GPU memory headroom with conservative 25% increments
+def auto_adjust_batch_size(initial_batch_size, headroom_threshold=4 * 1024 * 1024 * 1024):  # 4 GB headroom
     if not torch.cuda.is_available():
         return initial_batch_size
     
     free_mem, total_mem = torch.cuda.mem_get_info()
+    # Use more conservative incremental growth to avoid OOM
     if free_mem > headroom_threshold:
-        return initial_batch_size * 2  # Double if enough headroom
+        return int(initial_batch_size * 1.25)  # 25% increase instead of doubling
     return initial_batch_size
 
 # PERF: Setup profiler for a given number of steps

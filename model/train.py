@@ -49,90 +49,34 @@ class SARSuperResDataset(Dataset):
     SAR Super-Resolution Dataset
     
     Loads dual-pol complex SAR patches for super-resolution training.
-    Assumes directory structure:
-    data_dir/
-    ├── LR/  # Low resolution patches (64x128)
-    ├── HR/  # High resolution patches (256x512)
-    
-    Each patch is a .npy file with shape (2, H, W) complex64
     """
     
-    def __init__(self, data_dir: str, split: str = 'train', lr_size: Tuple[int, int] = (128, 64),
-                 hr_size: Tuple[int, int] = (512, 256), *, use_cache: bool = True, gpu_degrade: bool = False):  # Corrected HR size
+    def __init__(self, file_list: list, data_dir: str, lr_size: Tuple[int, int] = (128, 64),
+                 hr_size: Tuple[int, int] = (512, 256), *, use_cache: bool = True, gpu_degrade: bool = False):
 
         """
         Initialize SAR dataset
         
         Args:
-            data_dir: Base data directory (D:\Sentinel-1\data\processed_2)
-            split: Dataset split ('train', 'val', 'test')
+            file_list: A list of file paths for this dataset split.
+            data_dir: Base data directory (for synthetic data generation).
             lr_size: Low resolution patch size (height, width)
             hr_size: High resolution patch size (height, width)
         """
+        self.hr_files = file_list
         self.data_dir = Path(data_dir)
-        self.split = split
         self.lr_size = lr_size
         self.hr_size = hr_size
         self.use_cache = use_cache
         self.gpu_degrade = gpu_degrade
         
-        # For now, we'll simulate LR/HR pairs from existing data
-        # In practice, you would have pre-generated LR patches
-        self.hr_files = self._find_sar_patches()
-        
-        print(f"Found {len(self.hr_files)} SAR patches for {split} split")
+        print(f"Initialized dataset with {len(self.hr_files)} SAR patches.")
         
         if len(self.hr_files) == 0:
-            print(f"Warning: No SAR patches found in {self.data_dir}")
+            print(f"Warning: No SAR patches provided for this split.")
             print("Creating synthetic dataset for testing...")
             self._create_synthetic_data()
     
-    def _find_sar_patches(self):
-        pattern = "*_dual_pol_complex_*.npy"
-        cache_path = self.data_dir / f'valid_hr_files_{self.split}.pkl'
-        if cache_path.exists():
-            with open(cache_path, 'rb') as f:
-                hr_files = pickle.load(f)
-            print(f"Loaded {len(hr_files)} cached valid patches for {self.split}")
-            return hr_files  # No reshuffle needed if cached post-split
-
-        potential_files = list(self.data_dir.rglob(pattern))
-        max_total_patches = 20000  
-        buffer_size = 30000
-        hr_files = []
-        filtered_count = 0
-        for file in potential_files[buffer_size:max_total_patches+buffer_size]:
-            hr_data = np.load(file).astype(np.complex64)
-            if hr_data.shape[0] != 2: 
-                filtered_count += 1
-                continue
-            vv, vh = hr_data[0], hr_data[1]
-            cross = np.mean(vv * np.conj(vh))
-            pow_vv = np.mean(np.abs(vv)**2)
-            pow_vh = np.mean(np.abs(vh)**2)
-            coherence = np.abs(cross) / np.sqrt(pow_vv * pow_vh + 1e-8)
-            if coherence >= 0.0:     # 실제 필터링 제거 # Relaxed filter to avoid data scarcity
-                hr_files.append(file)
-            else:
-                filtered_count += 1
-        
-        print(f"Filtered {filtered_count} marine patches ({filtered_count/len(potential_files)*100:.1f}%)")
-        
-        # Shuffle and split
-        np.random.shuffle(hr_files)
-        n_total = len(hr_files)
-        if self.split == 'train':
-            split_files = hr_files[:int(0.8 * n_total)]
-        elif self.split == 'val':
-            split_files = hr_files[int(0.8 * n_total):int(0.9 * n_total)]
-        else:  # test
-            split_files = hr_files[int(0.9 * n_total):]
-        
-        # Cache split for reuse
-        with open(cache_path, 'wb') as f:
-            pickle.dump(split_files, f)
-        
-        return split_files
     def _create_synthetic_data(self):
         """Create synthetic data for testing when no real data is available"""
         n_samples = 1000 if self.split == 'train' else 100
@@ -159,7 +103,7 @@ class SARSuperResDataset(Dataset):
 
         # 스케일 = HR/LR 비
         scale = self.hr_size[0] // self.lr_size[0]      # ex. 4
-        assert hr.shape[-2:] == self.hr_size, "HR shape mismatch"
+        assert hr.shape[-2:] == self.hr_size, f"HR shape mismatch: got {hr.shape[-2:]}, expected {self.hr_size}"
 
         # 1) 전력합 → √: divisor_override=1 로 ‘합’을 바로 계산
         power = (hr.real**2 + hr.imag**2).unsqueeze(0)       # (1,2,H,W)
@@ -199,25 +143,12 @@ class SARSuperResDataset(Dataset):
             hr_file = self.hr_files[idx]
             hr_data = np.load(hr_file)
         
-        # FIX: Enforce exact HR size by cropping (handles patches larger than 512x256)
-        hr_data = hr_data[:, :self.hr_size[0], :self.hr_size[1]]  # Corrected cropping to include channel dim explicitly
-        
+        # HR size is now consistent - no cropping/padding needed
         # Ensure correct shape and data type
         if hr_data.shape != (2, *self.hr_size):
             # Transpose if dimensions are swapped (512,256) vs (256,512)
             if hr_data.shape == (2, self.hr_size[1], self.hr_size[0]):
                 hr_data = np.transpose(hr_data, (0, 2, 1))  # Swap height/width
-            else:
-                # Apply padding if needed
-                if len(hr_data.shape) == 3 and hr_data.shape[0] == 2:
-                    pad_h = max(0, self.hr_size[0] - hr_data.shape[1])
-                    pad_w = max(0, self.hr_size[1] - hr_data.shape[2])
-                    if pad_h > 0 or pad_w > 0:
-                        # Change: Use reflective padding instead of constant zeros
-                        # Reason: Reflective padding preserves phase coherence and speckle patterns in SAR images,
-                        # avoiding artificial discontinuities that zero-padding introduces, which can create edge artifacts
-                        # in super-resolution outputs. This maintains the interferometric properties better.
-                        hr_data = np.pad(hr_data, ((0,0), (0,pad_h), (0,pad_w)), mode='reflect')
         
         # Convert to complex64 if not already
         if hr_data.dtype != np.complex64:
@@ -256,19 +187,11 @@ class SARSuperResDataset(Dataset):
             hr_file = self.hr_files[idx]
             hr_data = np.load(hr_file)
 
-        # FIX: Enforce exact HR size by cropping/padding to handle inconsistent source patches
-        hr_data = hr_data[:, :self.hr_size[0], :self.hr_size[1]]
-
-        # Ensure correct shape and data type through transpose or padding
+        # HR size is now consistent - no cropping/padding needed
+        # Ensure correct shape and data type through transpose only
         if hr_data.shape != (2, *self.hr_size):
             if hr_data.shape == (2, self.hr_size[1], self.hr_size[0]):
                 hr_data = np.transpose(hr_data, (0, 2, 1))
-            else:
-                if len(hr_data.shape) == 3 and hr_data.shape[0] == 2:
-                    pad_h = max(0, self.hr_size[0] - hr_data.shape[1])
-                    pad_w = max(0, self.hr_size[1] - hr_data.shape[2])
-                    if pad_h > 0 or pad_w > 0:
-                        hr_data = np.pad(hr_data, ((0,0), (0,pad_h), (0,pad_w)), mode='reflect')
 
         # Ensure dtype consistency
         if hr_data.dtype != np.complex64:
@@ -304,26 +227,70 @@ class EarlyStopping:
         return False
 
 
-def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0, *, use_cache: bool = True, gpu_degrade: bool = False):
+def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0, *, use_cache: bool = True, gpu_degrade: bool = False, max_samples: int = None):
     """
     Create train and validation dataloaders
+    
+    Args:
+        data_dir: Directory containing SAR data patches
+        batch_size: Batch size for dataloaders
+        num_workers: Number of dataloader workers
+        use_cache: Whether to use cached file splits
+        gpu_degrade: Whether to run HR→LR degradation on GPU
+        max_samples: Maximum number of samples to use (None for all data)
     """
-    # Safety: warn when using worker processes with CUDA
-    if num_workers != 0:
-        print(f"[Warning] num_workers set to {num_workers}. CUDA DataLoader workers may clash with GPU ops. Consider keeping it 0 unless necessary.")
+    # --- Centralized File Scanning and Splitting ---
+    pattern = "*_dual_pol_complex_*.npy"
+    cache_path = Path(data_dir) / 'file_split_cache.pkl'
     
+    # Generate cache key based on max_samples to avoid conflicts
+    if max_samples is not None:
+        cache_path = Path(data_dir) / f'file_split_cache_{max_samples}.pkl'
+    
+    if use_cache and cache_path.exists():
+        with open(cache_path, 'rb') as f:
+            file_splits = pickle.load(f)
+        print(f"Loaded file splits from cache: {cache_path}")
+        if max_samples is not None:
+            print(f"Using subset of {max_samples} samples")
+    else:
+        print("Scanning for all .npy files and creating new train/val/test splits...")
+        all_files = list(Path(data_dir).rglob(pattern))
+        
+        # Limit samples if specified
+        if max_samples is not None and max_samples < len(all_files):
+            print(f"Limiting dataset to {max_samples} samples out of {len(all_files)} available")
+            np.random.seed(42)  # For reproducible subset selection
+            np.random.shuffle(all_files)
+            all_files = all_files[:max_samples]
+        else:
+            np.random.shuffle(all_files)
+        
+        n_total = len(all_files)
+        n_train = int(0.8 * n_total)
+        n_val = int(0.1 * n_total)
+        
+        file_splits = {
+            'train': all_files[:n_train],
+            'val': all_files[n_train : n_train + n_val],
+            'test': all_files[n_train + n_val:]
+        }
+        
+        with open(cache_path, 'wb') as f:
+            pickle.dump(file_splits, f)
+        print(f"Saved new file splits to cache: {cache_path}")
 
-    # Create datasets
-    train_dataset = SARSuperResDataset(data_dir, split='train', use_cache=use_cache, gpu_degrade=gpu_degrade)
-    val_dataset = SARSuperResDataset(data_dir, split='val', use_cache=use_cache, gpu_degrade=gpu_degrade)
+    # Create datasets with pre-split file lists
+    train_dataset = SARSuperResDataset(file_splits['train'], data_dir, use_cache=use_cache, gpu_degrade=gpu_degrade)
+    val_dataset = SARSuperResDataset(file_splits['val'], data_dir, use_cache=use_cache, gpu_degrade=gpu_degrade)
     
-    # PERF: Add persistent_workers and pin_memory for faster DataLoader
+    # PERF: Optimized DataLoader settings - pin_memory=False for better stability
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,  # Changed to False for better stability
         persistent_workers=(num_workers > 0)
     )
     
@@ -332,7 +299,7 @@ def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0
         batch_size=batch_size, 
         shuffle=False, 
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,  # Changed to False for better stability
         persistent_workers=(num_workers > 0)
     )
     
@@ -366,7 +333,7 @@ def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual
         
         # PERF: Wrap forward and backward in AMP autocast and scaler
         optimizer.zero_grad()
-        with autocast(device_type='cuda'):
+        with autocast(device_type='cuda', enabled=device.type=='cuda', dtype=torch.float32):
             pred_hr = model(lr_batch)
             
             # FIX: Shape guard to ensure pred_hr and hr_batch dimensions match
@@ -432,7 +399,7 @@ def validate_epoch(model, val_loader, device, metrics_calc, perceptual):
     
     # PERF: Use autocast for validation forward pass
     with torch.no_grad():
-        with autocast(device_type='cuda'):
+        with autocast(device_type='cuda', enabled=device.type=='cuda', dtype=torch.float32):
             for lr_batch, hr_batch in val_loader:
                 lr_batch = lr_batch.to(device, non_blocking=True)
                 hr_batch = hr_batch.to(device, non_blocking=True)
@@ -467,47 +434,67 @@ def validate_epoch(model, val_loader, device, metrics_calc, perceptual):
     return total_loss / max(total_samples, 1)
 
 
-def log_images_to_tensorboard(writer, raw_batch, lr_batch, hr_batch, pred_batch, epoch, num_images=4):
-    # Convert to amplitude for visualization
-        # --- Raw patch amplitude (VV) ---
-    raw_amp = torch.abs(raw_batch[:num_images, 0])  # raw_batch is complex64 [B, Pol, H, W]
-    # --- LR amplitude (VV) ---
-    lr_amp = torch.sqrt(lr_batch[:num_images, 0]**2 + lr_batch[:num_images, 1]**2)
-    # FIX: Handle real 2-channel tensors properly for amplitude calculation
-    hr_amp = torch.abs(torch.complex(hr_batch[:num_images, 0], hr_batch[:num_images, 1]))
-    pred_amp = torch.abs(torch.complex(pred_batch[:num_images, 0], pred_batch[:num_images, 1]))
+def log_images_to_tensorboard(writer, raw_batch, lr_batch, hr_batch, pred_batch, epoch, num_images=4, fixed_range=(0.001, 10.0)):
+    """
+    Logs SAR image visualizations to TensorBoard with consistent normalization.
+    - Uses fixed dB range for consistent brightness across all epochs.
+    - Calculates VV and VH amplitude correctly.
+    - Upscales LR image for consistent visualization size.
     
-    # Normalize for display (log scale for SAR)
-    lr_amp_log = torch.log10(lr_amp + 1e-8)
-    hr_amp_log = torch.log10(hr_amp + 1e-8)
-    pred_amp_log = torch.log10(pred_amp + 1e-8)
-    raw_amp_log  = torch.log10(raw_amp + 1e-8)
+    Args:
+        fixed_range: Tuple of (min_db, max_db) for consistent normalization across epochs
+    """
+    num_images = min(num_images, lr_batch.shape[0])
+    hr_size = (hr_batch.shape[2], hr_batch.shape[3]) # e.g., (512, 256)
     
-    # Normalize to [0, 1]
-    lr_norm = (lr_amp_log - lr_amp_log.min()) / (lr_amp_log.max() - lr_amp_log.min() + 1e-8)
-    hr_norm = (hr_amp_log - hr_amp_log.min()) / (hr_amp_log.max() - hr_amp_log.min() + 1e-8)
-    pred_norm = (pred_amp_log - pred_amp_log.min()) / (pred_amp_log.max() - pred_amp_log.min() + 1e-8)
-    raw_norm  = (raw_amp_log  - raw_amp_log.min())  / (raw_amp_log.max()  - raw_amp_log.min()  + 1e-8)
+    # --- 1. Correctly calculate amplitude for each polarization (VV and VH) ---
+    # Note: torch.hypot(real, imag) is a robust way to compute sqrt(real**2 + imag**2)
     
-    # Add channel dim
-    lr_norm  = lr_norm.unsqueeze(1)
-    hr_norm  = hr_norm.unsqueeze(1)
-    pred_norm = pred_norm.unsqueeze(1)
-    raw_norm  = raw_norm.unsqueeze(1)
+    # Raw HR (complex)
+    raw_amp_vv = torch.abs(raw_batch[:num_images, 0]) # VV
+    raw_amp_vh = torch.abs(raw_batch[:num_images, 1]) # VH
     
-    # Convert to uint8 PNG-friendly tensors to reduce log size
-    lr_uint8  = (lr_norm  * 255).clamp(0, 255).to(torch.uint8)
-    hr_uint8  = (hr_norm  * 255).clamp(0, 255).to(torch.uint8)
-    pred_uint8= (pred_norm * 255).clamp(0, 255).to(torch.uint8)
-    raw_uint8 = (raw_norm * 255).clamp(0, 255).to(torch.uint8)
+    # LR (4-channel real)
+    lr_amp_vv = torch.hypot(lr_batch[:num_images, 0], lr_batch[:num_images, 1])
+    lr_amp_vh = torch.hypot(lr_batch[:num_images, 2], lr_batch[:num_images, 3])
+    
+    # HR Target (4-channel real)
+    hr_amp_vv = torch.hypot(hr_batch[:num_images, 0], hr_batch[:num_images, 1])
+    hr_amp_vh = torch.hypot(hr_batch[:num_images, 2], hr_batch[:num_images, 3])
+    
+    # SR Prediction (4-channel real)
+    pred_amp_vv = torch.hypot(pred_batch[:num_images, 0], pred_batch[:num_images, 1])
+    pred_amp_vh = torch.hypot(pred_batch[:num_images, 2], pred_batch[:num_images, 3])
 
-    # Log
-    writer.add_images('SAR_Images/Raw_VV', raw_uint8, epoch)
-    writer.add_images('SAR_Images/LR_Input_VV', lr_uint8, epoch)
-    writer.add_images('SAR_Images/HR_Target_VV', hr_uint8, epoch)
-    writer.add_images('SAR_Images/SR_Prediction_VV', pred_uint8, epoch)
+    # --- 2. Upscale LR and Raw images for visualization purposes ---
+    # This does not affect training, only what's shown on TensorBoard.
+    raw_amp_vv_up = F.interpolate(raw_amp_vv.unsqueeze(1), size=hr_size, mode='bilinear', align_corners=False).squeeze(1)
+    raw_amp_vh_up = F.interpolate(raw_amp_vh.unsqueeze(1), size=hr_size, mode='bilinear', align_corners=False).squeeze(1)
+    lr_amp_vv_up = F.interpolate(lr_amp_vv.unsqueeze(1), size=hr_size, mode='nearest').squeeze(1)
+    lr_amp_vh_up = F.interpolate(lr_amp_vh.unsqueeze(1), size=hr_size, mode='nearest').squeeze(1)
 
+    # --- 3. Normalize images with fixed dB range for consistency ---
+    def normalize_for_display_fixed_range(amp_tensor, min_db, max_db):
+        # Log scale for better contrast in SAR images
+        log_amp = 20 * torch.log10(amp_tensor + 1e-8)  # Convert to dB
+        # Normalize to [0, 1] using fixed dB range
+        norm_amp = (log_amp - min_db) / (max_db - min_db)
+        # Add channel dimension and convert to uint8
+        return (norm_amp.unsqueeze(1).clamp(0, 1) * 255).to(torch.uint8)
 
+    min_db, max_db = fixed_range
+
+    # --- VV Polarization Visualization ---
+    writer.add_images('SAR_Images_VV/1_Raw_HR', normalize_for_display_fixed_range(raw_amp_vv_up, min_db, max_db), epoch)
+    writer.add_images('SAR_Images_VV/2_LR_Input_Upscaled', normalize_for_display_fixed_range(lr_amp_vv_up, min_db, max_db), epoch)
+    writer.add_images('SAR_Images_VV/3_HR_Target', normalize_for_display_fixed_range(hr_amp_vv, min_db, max_db), epoch)
+    writer.add_images('SAR_Images_VV/4_SR_Prediction', normalize_for_display_fixed_range(pred_amp_vv, min_db, max_db), epoch)
+
+    # --- VH Polarization Visualization ---
+    writer.add_images('SAR_Images_VH/1_Raw_HR', normalize_for_display_fixed_range(raw_amp_vh_up, min_db, max_db), epoch)
+    writer.add_images('SAR_Images_VH/2_LR_Input_Upscaled', normalize_for_display_fixed_range(lr_amp_vh_up, min_db, max_db), epoch)
+    writer.add_images('SAR_Images_VH/3_HR_Target', normalize_for_display_fixed_range(hr_amp_vh, min_db, max_db), epoch)
+    writer.add_images('SAR_Images_VH/4_SR_Prediction', normalize_for_display_fixed_range(pred_amp_vh, min_db, max_db), epoch)
 def log_complex_statistics(writer, tensor, tag, epoch):
     if not torch.is_complex(tensor):
         if tensor.shape[1] < 2:
@@ -565,8 +552,8 @@ def setup_tensorboard_logging(log_dir: str = None) -> SummaryWriter:
 
 
 def train_model(
-    data_dir: str = r"D:\Sentinel-1\data\processed_2",
-    model_save_path: str = r"D:\Sentinel-1\model\cv_unet.pth",
+    data_dir: str = r"D:\Sentinel-1\data\patches\zero_filtered",
+    model_save_path: str = r"D:\Sentinel-1\model\acswin_unet_pp.pth",
     num_epochs: int = 50,
     batch_size: int = 16,
     learning_rate: float = 1e-4,
@@ -580,6 +567,7 @@ def train_model(
     use_cache: bool = True,
     gpu_degrade: bool = False,
     num_workers: int = 0,
+    max_samples: int = None,
 ):
     """
     Main training function with TensorBoard logging
@@ -615,20 +603,23 @@ def train_model(
     # Instantiate PerceptualLoss only when enabled
     perceptual = PerceptualLoss().to(device) if enable_perceptual else None
     
-    # Log model architecture to TensorBoard
+    # Log model architecture to TensorBoard (commented out due to trace errors)
     if writer:
         dummy_input = torch.randn(1, 4, 64, 128).to(device) # Adjusted dummy input to match real-valued shape
         
-        try:
-            writer.add_graph(model, dummy_input)
-        except Exception as e:
-            print(f"Warning: Could not log model graph: {e}")
+        # try:
+        #     writer.add_graph(model, dummy_input)
+        # except Exception as e:
+        #     print(f"Warning: Could not log model graph: {e}")
+        print("Note: Model graph logging disabled to avoid trace errors")
     
     # DataLoader workers already passed via parameter; keeping as is
     
     # Create dataloaders
     print(f"\nLoading data from {data_dir}...")
-    train_loader, val_loader = create_dataloaders(data_dir, batch_size, num_workers, use_cache=use_cache, gpu_degrade=gpu_degrade)
+    if max_samples is not None:
+        print(f"Limiting dataset to {max_samples} samples")
+    train_loader, val_loader = create_dataloaders(data_dir, batch_size, num_workers, use_cache=use_cache, gpu_degrade=gpu_degrade, max_samples=max_samples)
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     
     # Setup optimizer and scheduler for better convergence
@@ -718,8 +709,19 @@ def train_model(
             if writer:
                 writer.add_scalar('Loss/Train', train_loss, epoch)
                 writer.add_scalar('Loss/Val', val_loss, epoch)
+                
+                # Dual-polarization PSNR logging
+                writer.add_scalar('PSNR/Train_VV', train_avg_metrics.get('psnr_vv', 0), epoch)
+                writer.add_scalar('PSNR/Train_VH', train_avg_metrics.get('psnr_vh', 0), epoch)
+                writer.add_scalar('PSNR/Train_Avg', train_avg_metrics.get('psnr_avg', 0), epoch)
+                writer.add_scalar('PSNR/Val_VV', val_avg_metrics.get('psnr_vv', 0), epoch)
+                writer.add_scalar('PSNR/Val_VH', val_avg_metrics.get('psnr_vh', 0), epoch)
+                writer.add_scalar('PSNR/Val_Avg', val_avg_metrics.get('psnr_avg', 0), epoch)
+                
+                # Legacy PSNR (VV) for backward compatibility
                 writer.add_scalar('PSNR/Train', train_avg_metrics.get('psnr', 0), epoch)
                 writer.add_scalar('PSNR/Val', val_avg_metrics.get('psnr', 0), epoch)
+                
                 writer.add_scalar('RMSE/Val', val_avg_metrics.get('rmse', 0), epoch)
                 writer.add_scalar('CPIF/Val', val_avg_metrics.get('cpif', 0), epoch)
                 writer.add_scalar('Learning_Rate', current_lr, epoch)
@@ -762,8 +764,8 @@ def train_model(
             epoch_time = time.time() - epoch_start
             print(f"\nEpoch {epoch+1} Results ({epoch_time:.1f}s):")
             print(f"  Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
-            print(f"  Train PSNR: {train_avg_metrics.get('psnr', 0):.2f} dB")
-            print(f"  Val PSNR: {val_avg_metrics.get('psnr', 0):.2f} dB")
+            print(f"  Train PSNR - VV: {train_avg_metrics.get('psnr_vv', 0):.2f} dB, VH: {train_avg_metrics.get('psnr_vh', 0):.2f} dB, Avg: {train_avg_metrics.get('psnr_avg', 0):.2f} dB")
+            print(f"  Val PSNR - VV: {val_avg_metrics.get('psnr_vv', 0):.2f} dB, VH: {val_avg_metrics.get('psnr_vh', 0):.2f} dB, Avg: {val_avg_metrics.get('psnr_avg', 0):.2f} dB")
             
             # Save best model
             if val_loss < best_val_loss:
@@ -808,13 +810,14 @@ def train_model(
     return model, history
 
 
-def test_model(model_path: str, data_dir: str):
+def test_model(model_path: str, data_dir: str, max_samples: int = None):
     """
     Test trained model on test set
     
     Args:
         model_path: Path to saved model
         data_dir: Data directory
+        max_samples: Maximum number of samples to use (should match training)
     """
     print(f"\nTesting model from {model_path}")
     
@@ -836,8 +839,22 @@ def test_model(model_path: str, data_dir: str):
     # FIX: Add perceptual loss instance for validate_epoch
     perceptual = PerceptualLoss().to(device)
     
+    # --- Load test split from cache ---
+    # Use appropriate cache file based on max_samples
+    if max_samples is not None:
+        cache_path = Path(data_dir) / f'file_split_cache_{max_samples}.pkl'
+    else:
+        cache_path = Path(data_dir) / 'file_split_cache.pkl'
+        
+    if not cache_path.exists():
+        print(f"Error: File split cache not found at {cache_path}. Please run training first to generate it.")
+        return
+        
+    with open(cache_path, 'rb') as f:
+        file_splits = pickle.load(f)
+    
     # Create test dataset
-    test_dataset = SARSuperResDataset(data_dir, split='test')
+    test_dataset = SARSuperResDataset(file_splits['test'], data_dir)
     test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
     
     # Test model
@@ -860,10 +877,11 @@ if __name__ == "__main__":
     parser.add_argument('--gpu-degrade', action='store_true', help="Run HR→LR degradation on GPU")
     parser.add_argument('--no-cache', action='store_true', help="Disable LR patch caching")
     parser.add_argument('--num-workers', type=int, default=0, help="DataLoader num_workers (default 0)")
-    parser.add_argument('--model-type', default='swin', choices=['swin','base'], help='Model backbone selection')
+    parser.add_argument('--model-type', default='swin', choices=['swin','base'], help='Model backbone selection (WARNING: base model has channel mismatch issues)')
     parser.add_argument('--dry-run', action='store_true', help='Run single forward pass and exit')
     parser.add_argument('--no-perceptual', action='store_true', help='Disable perceptual VGG loss')
     parser.add_argument('--auto-workers', action='store_true', help='Use optimal DataLoader workers automatically')
+    parser.add_argument('--max-samples', type=int, default=None, help='Maximum number of samples to use (None for all data)')
     args = parser.parse_args()
 
     # Set multiprocessing start method to avoid CUDA init deadlocks
@@ -879,13 +897,17 @@ if __name__ == "__main__":
     if args.model_type == 'swin':
         from ac_swin_unet_pp import create_model as create_model_fn
     else:
-        from cv_unet import create_model as create_model_fn
+        # Base model (cv_unet) has channel mismatch: expects 3 channels but dataset returns 4
+        print("ERROR: --model-type base is currently not supported due to channel mismatch.")
+        print("cv_unet expects 3 input channels (VV-Re, VV-Im, |VH|) but dataset returns 4 channels (VV-Re, VV-Im, VH-Re, VH-Im).")
+        print("Use --model-type swin instead, or modify cv_unet to accept 4 channels.")
+        sys.exit(1)
     globals()['create_model'] = create_model_fn
 
     # Configuration
     config = {
-        'data_dir': r"D:\Sentinel-1\data\processed_2",
-        'model_save_path': r"D:\Sentinel-1\model\cv_unet.pth",
+        'data_dir': r"D:\Sentinel-1\data\patches\zero_filtered",
+        'model_save_path': r"D:\Sentinel-1\model\acswin_unet_pp.pth",
         'num_epochs': 100,  # Increased from 50 for better convergence
         'batch_size': 64,   # Increased from 24 to 32 for better convergence
         'learning_rate': 1e-4,
@@ -896,7 +918,8 @@ if __name__ == "__main__":
         'gpu_degrade': args.gpu_degrade,
         'num_workers': get_optimal_workers() if args.auto_workers else args.num_workers,
         'tensorboard_log_dir': None,  # Will use timestamped directory
-        'enable_perceptual': not args.no_perceptual
+        'enable_perceptual': not args.no_perceptual,
+        'max_samples': args.max_samples,
     }
     
     # PERF: Auto-adjust batch size if flag set
@@ -924,7 +947,7 @@ if __name__ == "__main__":
         model, history = train_model(**config, profile_steps=args.profile)
         
         # Test model
-        test_model(config['model_save_path'], config['data_dir'])
+        test_model(config['model_save_path'], config['data_dir'], config['max_samples'])
         
         print("\nTraining and testing completed successfully!")
         

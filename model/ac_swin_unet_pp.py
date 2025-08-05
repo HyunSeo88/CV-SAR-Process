@@ -10,7 +10,7 @@ Key points vs. prototype version:
 3. Dense skip(U-Net++), Complex SE + Spatial Attention, Complex PixelShuffle upsampling.
 
 Input  : (B,4,H, W) real
-Output : (B,4,H,4·W) real (anisotropic 4× only in width, LR height 유지)
+Output : (B,4,4H,4W) real (isotropic 4× upsampling in both height and width)
 """
 from __future__ import annotations
 
@@ -50,6 +50,44 @@ class ComplexGELU(nn.Module):
         return x * (F.gelu(mag) / (mag + 1e-8))
 
 # ================================================================
+# Complex PixelShuffle for upsampling
+# ================================================================
+
+class ComplexPixelShuffle(nn.Module):
+    """Complex-valued pixel shuffle for anisotropic upsampling."""
+    def __init__(self, in_c: int, out_c: int, scale):
+        super().__init__()
+        # Handle both int and tuple scale factors
+        if isinstance(scale, int):
+            self.scale_h = self.scale_w = scale
+        else:
+            self.scale_h, self.scale_w = scale
+        
+        total_scale = self.scale_h * self.scale_w
+        self.conv = ComplexConv2d(in_c, out_c * total_scale, 3, 1, 1)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Apply complex convolution
+        x = self.conv(x)
+        B, C, H, W = x.shape
+        
+        # Reshape for anisotropic pixel shuffle
+        # x has shape [B, out_c * scale_h * scale_w, H, W]
+        out_c = C // (self.scale_h * self.scale_w)
+        
+        # Real part
+        real = x.real.view(B, out_c, self.scale_h, self.scale_w, H, W)
+        real = real.permute(0, 1, 4, 2, 5, 3).contiguous()
+        real = real.view(B, out_c, H * self.scale_h, W * self.scale_w)
+        
+        # Imaginary part  
+        imag = x.imag.view(B, out_c, self.scale_h, self.scale_w, H, W)
+        imag = imag.permute(0, 1, 4, 2, 5, 3).contiguous()
+        imag = imag.view(B, out_c, H * self.scale_h, W * self.scale_w)
+        
+        return torch.complex(real, imag)
+
+# ================================================================
 # Attention blocks
 # ================================================================
 
@@ -69,7 +107,11 @@ class ComplexSpatialAttn(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(3, 1, k, padding=k//2, bias=False)
     def forward(self, x):
-        feat = torch.cat([torch.abs(x), x.real, x.imag], 1)
+        # Create spatial attention map using aggregated channel information
+        abs_feat = torch.mean(torch.abs(x), dim=1, keepdim=True)      # [B, 1, H, W]
+        real_feat = torch.mean(x.real, dim=1, keepdim=True)          # [B, 1, H, W] 
+        imag_feat = torch.mean(x.imag, dim=1, keepdim=True)          # [B, 1, H, W]
+        feat = torch.cat([abs_feat, real_feat, imag_feat], 1)        # [B, 3, H, W]
         m = torch.sigmoid(self.conv(feat))
         return x * m
 
@@ -80,17 +122,22 @@ class ComplexSpatialAttn(nn.Module):
 class EncBlock(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
-        self.conv = ComplexConv2d(in_c, out_c, (3,7), (1,2), (1,3))
+        self.conv = ComplexConv2d(in_c, out_c, (7,3), (2,2), (3,1))  # Adjusted kernel and padding for (512,256) data
         self.bn   = ComplexBN(out_c)
         self.act  = ComplexGELU()
     def forward(self,x):
         return self.act(self.bn(self.conv(x)))
 
 class DecBlock(nn.Module):
-    def __init__(self, in_c, out_c, scale=2):
+    def __init__(self, in_c, out_c, scale=2, skip_ch=None):
         super().__init__()
         self.up   = ComplexPixelShuffle(in_c, out_c, scale)
-        self.c1   = ComplexConv2d(out_c*2, out_c, 3,1,1)
+        # Calculate input channels for first conv: upsampled + skip features
+        if skip_ch is None or skip_ch == 0:
+            conv_in_ch = out_c  # No skip connection
+        else:
+            conv_in_ch = out_c + skip_ch  # With skip connection
+        self.c1   = ComplexConv2d(conv_in_ch, out_c, 3,1,1)
         self.b1   = ComplexBN(out_c)
         self.c2   = ComplexConv2d(out_c, out_c, 3,1,1)
         self.b2   = ComplexBN(out_c)
@@ -99,7 +146,8 @@ class DecBlock(nn.Module):
         self.sa   = ComplexSpatialAttn()
     def forward(self,x,skip):
         x = self.up(x)
-        x = torch.cat([x,skip],1)
+        if skip is not None:
+            x = torch.cat([x,skip],1)
         x = self.act(self.b1(self.c1(x)))
         x = self.act(self.b2(self.c2(x)))
         x = self.sa(self.se(x))
@@ -140,23 +188,48 @@ class ComplexWindowAttn(nn.Module):
         return self.proj(out)
 
 class SwinBlock(nn.Module):
-    def __init__(self,dim,heads,win=(8,4),shift:bool=False):
+    def __init__(self,dim,heads,win=(8,4),stride=(4,2),shift:bool=False):
         super().__init__()
-        self.win,self.shift=win,shift
+        self.win,self.stride,self.shift=win,stride,shift
         self.attn = ComplexWindowAttn(dim,heads,win)
         self.n1 = ComplexBN(dim); self.n2 = ComplexBN(dim)
         self.mlp= nn.Sequential(ComplexConv2d(dim,dim*4,1,1,0),ComplexGELU(),ComplexConv2d(dim*4,dim,1,1,0))
     def forward(self,x):
         B,C,H,W = x.shape
         if self.shift:
-            x = torch.roll(x, shifts=(-self.win[0]//2, -self.win[1]//2), dims=(2,3))
-        # partition
-        assert H%self.win[0]==0 and W%self.win[1]==0, "Input size must be multiple of window"
-        x_ = rearrange(x,'b c (h p1) (w p2)-> (b h w) c p1 p2',p1=self.win[0],p2=self.win[1])
-        x_ = self.attn(x_)
-        x_ = rearrange(x_,'(b h w) c p1 p2 -> b c (h p1) (w p2)',h=H//self.win[0],w=W//self.win[1])
+            x = torch.roll(x, shifts=(-self.stride[0]//2, -self.stride[1]//2), dims=(2,3))
+        
+        # Extract overlapping windows with stride
+        # Unfold creates overlapping patches
+        x_unfold = F.unfold(x, kernel_size=self.win, stride=self.stride)  # [B, C*win_h*win_w, num_windows]
+        num_windows = x_unfold.size(-1)
+        
+        # Reshape to [B*num_windows, C, win_h, win_w]
+        x_windows = x_unfold.view(B, C, self.win[0], self.win[1], num_windows)
+        x_windows = x_windows.permute(0, 4, 1, 2, 3).contiguous()  # [B, num_windows, C, win_h, win_w]
+        x_windows = x_windows.view(B * num_windows, C, self.win[0], self.win[1])
+        
+        # Apply attention to each window
+        x_attn = self.attn(x_windows)  # [B*num_windows, C, win_h, win_w]
+        
+        # Reshape back and fold to reconstruct feature map
+        x_attn = x_attn.view(B, num_windows, C, self.win[0], self.win[1])
+        x_attn = x_attn.permute(0, 2, 3, 4, 1).contiguous()  # [B, C, win_h, win_w, num_windows]
+        x_attn = x_attn.view(B, C * self.win[0] * self.win[1], num_windows)
+        
+        # Fold back to original spatial dimensions
+        output_size = (H, W)
+        x_ = F.fold(x_attn, output_size=output_size, kernel_size=self.win, stride=self.stride)
+        
+        # Handle overlapping regions by normalizing
+        ones = torch.ones_like(x)
+        ones_unfold = F.unfold(ones, kernel_size=self.win, stride=self.stride)
+        ones_fold = F.fold(ones_unfold, output_size=output_size, kernel_size=self.win, stride=self.stride)
+        x_ = x_ / (ones_fold + 1e-8)  # Normalize overlapping regions
+        
         if self.shift:
-            x_ = torch.roll(x_, shifts=(self.win[0]//2, self.win[1]//2), dims=(2,3))
+            x_ = torch.roll(x_, shifts=(self.stride[0]//2, self.stride[1]//2), dims=(2,3))
+        
         x = self.n1(x+x_)
         x = self.n2(x+self.mlp(x))
         return x
@@ -166,7 +239,7 @@ class SwinBlock(nn.Module):
 # ================================================================
 
 class ACSwinUNetPP(nn.Module):
-    def __init__(self, base_dim:int=64, heads:int=4, depth:int=2):
+    def __init__(self, base_dim:int=64, heads:int=4, depth:int=4):
         super().__init__()
         # 4-real → 2-complex helper handled in forward
         self.enc1 = EncBlock(2, base_dim)
@@ -174,13 +247,17 @@ class ACSwinUNetPP(nn.Module):
         self.enc3 = EncBlock(base_dim*2, base_dim*4)
         blocks: List[nn.Module] = []
         for i in range(depth):
-            blocks.append(SwinBlock(base_dim*4, heads, win=(8,4), shift=(i%2==1)))
+            blocks.append(SwinBlock(base_dim*4, heads, win=(16,8), stride=(8,4), shift=(i%2==1)))
         self.bottleneck = nn.Sequential(*blocks)
-        self.dec2 = DecBlock(base_dim*4, base_dim*2)
-        self.dec1 = DecBlock(base_dim*2, base_dim)
+        # Three decoder layers to match three encoder layers + additional upsampling for 4x SR
+        self.dec3 = DecBlock(base_dim*4, base_dim*2, scale=(2,2), skip_ch=base_dim*2)  # 1/8 -> 1/4, skip e2 
+        self.dec2 = DecBlock(base_dim*2, base_dim, scale=(2,2), skip_ch=base_dim)      # 1/4 -> 1/2, skip e1
+        self.dec1 = DecBlock(base_dim, base_dim//2, scale=(2,2), skip_ch=0)           # 1/2 -> 1/1, no skip
+        # Additional 4x upsampling layer for super-resolution
+        self.super_res = ComplexPixelShuffle(base_dim//2, base_dim//4, scale=(4,4))
         self.final = nn.Sequential(
-            ComplexConv2d(base_dim, base_dim//2,3,1,1), ComplexGELU(),
-            ComplexConv2d(base_dim//2,2,1,1,0)
+            ComplexConv2d(base_dim//4, base_dim//8, 3,1,1), ComplexGELU(),
+            ComplexConv2d(base_dim//8, 2, 1,1,0)
         )
     def _real4_to_c2(self,x:torch.Tensor):
         vv = torch.complex(x[:,0],x[:,1]); vh = torch.complex(x[:,2],x[:,3])
@@ -190,24 +267,35 @@ class ACSwinUNetPP(nn.Module):
         return torch.stack([vv.real,vv.imag,vh.real,vh.imag],1)
     def forward(self, x: torch.Tensor):
         c = self._real4_to_c2(x)
-        e1 = self.enc1(c)
-        e2 = self.enc2(e1)
-        e3 = self.enc3(e2)
-        b  = self.bottleneck(e3)
-        d2 = self.dec2(b, e2)
-        d1 = self.dec1(d2, e1)
-        out = self.final(d1)
-        out = out + F.interpolate(c, size=out.shape[-2:], mode='bilinear', align_corners=False)
+        e1 = self.enc1(c)          # 1/2 resolution, base_dim channels
+        e2 = self.enc2(e1)         # 1/4 resolution, base_dim*2 channels  
+        e3 = self.enc3(e2)         # 1/8 resolution, base_dim*4 channels
+        b  = self.bottleneck(e3)   # 1/8 resolution, base_dim*4 channels
+        # Decoder with U-Net skip connections - each decoder upsamples and connects to corresponding encoder
+        d3 = self.dec3(b, e2)      # 1/4 resolution, skip from e2 (same resolution after upsampling)
+        d2 = self.dec2(d3, e1)     # 1/2 resolution, skip from e1 (same resolution after upsampling)  
+        d1 = self.dec1(d2, None)   # 1/1 resolution, no skip connection
+        # Super-resolution upsampling (4x)
+        sr = self.super_res(d1)    # 4x resolution, base_dim//4 channels
+        out = self.final(sr)       # 4x resolution, 2 complex channels
+        # Residual connection with properly upsampled input
+        residual_real = F.interpolate(x, size=out.shape[-2:], mode='bilinear', align_corners=False)
+        residual = self._real4_to_c2(residual_real)
+        out = out + residual
         return self._c2_to_real4(out)
 
+
+    def count_parameters(self):
+        """Return number of trainable parameters"""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 def create_model():
     return ACSwinUNetPP()
 
 if __name__ == "__main__":
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
-    m = create_model().to(dev).half()
-    x = torch.randn(2,4,64,128,device=dev,dtype=torch.float16)
+    m = create_model().to(dev)  # Use float32 instead of half() for complex support
+    x = torch.randn(2,4,64,128,device=dev)  # Use float32 instead of float16
     with torch.no_grad():
         y = m(x)
     print('out',y.shape)

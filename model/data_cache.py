@@ -16,8 +16,8 @@ def get_cache_path(hr_file: Path) -> Path:
     """Return path where LR cache for given HR file should be stored."""
     # Place all LR caches in a single 'lr_cache' folder adjacent to patch directory.
     # If hr_file is already inside an lr_cache directory, avoid nesting.
-    if hr_file.parent.name == "lr_cache":
-        cache_dir = hr_file.parent  # reuse existing
+    if "lr_cache" in hr_file.parts:
+        cache_dir = next(p for p in hr_file.parents if p.name == "lr_cache")
     else:
         cache_dir = hr_file.parent / "lr_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)

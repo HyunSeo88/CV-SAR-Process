@@ -27,11 +27,9 @@ def _ensure_complex(t: torch.Tensor) -> torch.Tensor:
         vv = torch.complex(t[:,0], t[:,1])
         vh = torch.complex(t[:,2], t[:,3])
         return torch.stack([vv, vh], 1)
-    if t.shape[1] == 2:
-        vv = torch.complex(t[:,0], t[:,1])
-        vh = torch.complex(t[:,1], t[:,0])  # Dummy second channel
-        return torch.stack([vv, vh], 1)
-    raise RuntimeError("Tensor shape not compatible with complex conversion")
+    # Remove 2-channel support as it creates artificial VH channel
+    # Single-polarization experiments should use dedicated functions
+    raise ValueError(f"Expected tensor with 4 channels for dual-pol complex conversion, but got {t.shape[1]} channels. Tensor shape: {t.shape}. For single-pol data, use dedicated single-channel loss functions.")
 
 
 class PerceptualLoss(nn.Module):
@@ -43,72 +41,77 @@ class PerceptualLoss(nn.Module):
             p.requires_grad = False
     
     def forward(self, recon, gt):
-        device = recon.device
-        # PERF: Guard .to(device) to prevent repeated transfers
-        if self.vgg[0].weight.device != device:
-            self.vgg = self.vgg.to(device)
+        # Convert real-valued 4-channel tensor to complex for magnitude calculation
+        recon_complex = torch.complex(recon[:, 0], recon[:, 1])
+        gt_complex = torch.complex(gt[:, 0], gt[:, 1])
         
-        # Perceptual loss operates on magnitude (which is real)
-        recon_mag = torch.abs(recon)
-        gt_mag = torch.abs(gt)
+        # Calculate magnitude and ensure it's 4D: (B, 1, H, W)
+        recon_mag = torch.abs(recon_complex).unsqueeze(1)
+        gt_mag = torch.abs(gt_complex).unsqueeze(1)
         
-        # Resize to 224x224 for VGG and expand to 3 channels
-        recon_mag_resized = F.interpolate(recon_mag.unsqueeze(1), size=(224, 224), mode='bilinear', align_corners=False).repeat(1,3,1,1)
-        gt_mag_resized = F.interpolate(gt_mag.unsqueeze(1), size=(224, 224), mode='bilinear', align_corners=False).repeat(1,3,1,1)
+        # Resize for VGG input and repeat for 3 channels
+        recon_mag_resized = F.interpolate(recon_mag, size=(224, 224), mode='bilinear', align_corners=False).repeat(1,3,1,1)
+        gt_mag_resized = F.interpolate(gt_mag, size=(224, 224), mode='bilinear', align_corners=False).repeat(1,3,1,1)
         
-        # Manual normalization for batch tensors
-        mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-        recon_mag_norm = (recon_mag_resized - mean) / std
-        gt_mag_norm = (gt_mag_resized - mean) / std
+        # Extract features
+        recon_features = self.vgg(recon_mag_resized)
+        gt_features = self.vgg(gt_mag_resized)
         
-        return F.mse_loss(self.vgg(recon_mag_norm), self.vgg(gt_mag_norm))
+        # Compute perceptual loss as MSE between feature maps
+        return F.mse_loss(recon_features, gt_features)
 
 
-def sr_loss(recon: torch.Tensor, gt: torch.Tensor, perceptual: nn.Module = None, cpif_weight: float = 0.1):
+def sr_loss(recon, gt, perceptual=None):
     """
-    Enhanced hybrid loss for complex SAR data. Assumes inputs are complex tensors.
-    Combines Amplitude MSE, Phase L1, Perceptual loss, and CPIF loss.
-
+    Computes SR loss: combination of amplitude, phase, and optional perceptual loss for both VV and VH polarizations.
+    
     Args:
-        recon (torch.Tensor): Reconstructed complex tensor.
-        gt (torch.Tensor): Ground truth complex tensor.
-        perceptual (nn.Module, optional): Pre-trained perceptual loss module.
-        cpif_weight (float, optional): Weight for the CPIF loss component.
-
+        recon: Reconstructed 4-channel real tensor (B, 4, H, W) - [VV-Re, VV-Im, VH-Re, VH-Im]
+        gt: Ground truth 4-channel real tensor (B, 4, H, W) - [VV-Re, VV-Im, VH-Re, VH-Im]
+        perceptual: PerceptualLoss instance
+        
     Returns:
-        dict: Dictionary containing total loss and its components.
+        Dictionary of loss components
     """
-    recon, gt = _ensure_complex(recon), _ensure_complex(gt)
-    # 1. Amplitude Loss (MSE)
-    amp_loss = F.mse_loss(torch.abs(recon), torch.abs(gt))
+    # loss weights
+    amp_weight = 0.5
+    phase_weight = 0.3
+    perceptual_weight = 0.05
+    # Convert to complex for both VV and VH polarizations
+    recon_vv = torch.complex(recon[:, 0], recon[:, 1])
+    recon_vh = torch.complex(recon[:, 2], recon[:, 3])
+    gt_vv = torch.complex(gt[:, 0], gt[:, 1])
+    gt_vh = torch.complex(gt[:, 2], gt[:, 3])
     
-    # 2. Phase Loss (L1 on the angle difference)
-    phase_diff = torch.angle(recon) - torch.angle(gt)
-    phase_diff = torch.atan2(torch.sin(phase_diff), torch.cos(phase_diff))
-    phase_loss = torch.mean(torch.abs(phase_diff))
+    # 1. Amplitude Loss (L1) for both polarizations
+    amp_loss_vv = F.l1_loss(torch.abs(recon_vv), torch.abs(gt_vv))
+    amp_loss_vh = F.l1_loss(torch.abs(recon_vh), torch.abs(gt_vh))
+    amp_loss = amp_weight * (amp_loss_vv + amp_loss_vh)
     
-    # Base hybrid loss
-    total_loss = 0.6 * amp_loss + 0.4 * phase_loss
-    loss_dict = {'amp_loss': amp_loss, 'phase_loss': phase_loss}
+    # 2. Phase Loss (L1) for both polarizations
+    phase_loss_vv = F.l1_loss(torch.angle(recon_vv), torch.angle(gt_vv))
+    phase_loss_vh = F.l1_loss(torch.angle(recon_vh), torch.angle(gt_vh))
+    phase_loss = phase_weight * (phase_loss_vv + phase_loss_vh)
     
-    # 3. Perceptual Loss (optional)
-    if perceptual:
-        p_loss = 0.1 * perceptual(recon, gt) # Pass complex tensors, handled inside
-        total_loss += p_loss
-        loss_dict['perceptual_loss'] = p_loss
-
-    # 4. CPIF Loss (optional)
-    # We want to maximize CPIF, so we minimize (1 - normalized_cpif)
-    cpif_val = calculate_cpif(recon, gt, reduction='mean')
-    # Normalize CPIF to a [0, 1] range roughly, assuming typical values are 0-20dB.
-    normalized_cpif = torch.sigmoid((cpif_val - 10) / 5) 
-    cpif_loss_val = (1.0 - normalized_cpif) * cpif_weight
-    total_loss += cpif_loss_val
-    loss_dict['cpif_loss'] = cpif_loss_val
+    # 3. Perceptual Loss (optional) - uses VV polarization for compatibility with VGG
+    p_loss = 0
+    if perceptual is not None:
+        # Pass the ORIGINAL 4-channel real tensors to perceptual loss
+        p_loss = perceptual_weight * perceptual(recon, gt)
     
-    loss_dict['total_loss'] = total_loss
-    return loss_dict
+    # Total loss
+    total_loss = amp_loss + phase_loss + p_loss
+    
+    return {
+        'total_loss': total_loss,
+        'amp_loss': amp_loss,
+        'amp_loss_vv': amp_loss_vv,
+        'amp_loss_vh': amp_loss_vh,
+        'phase_loss': phase_loss,
+        'phase_loss_vv': phase_loss_vv,
+        'phase_loss_vh': phase_loss_vh,
+        'perceptual_loss': p_loss
+    }
 
 
 def complex_mse_loss(recon, gt):
@@ -128,21 +131,54 @@ def calculate_rmse(recon: torch.Tensor, gt: torch.Tensor) -> float:
 
 
 def calculate_psnr(recon: torch.Tensor, gt: torch.Tensor, max_val: Optional[float] = None) -> float:
+    """Calculate PSNR for VV polarization (backward compatibility)."""
     recon, gt = _ensure_complex(recon), _ensure_complex(gt)
-    """Calculate Peak Signal-to-Noise Ratio for amplitude. Assumes complex inputs."""
     recon_amp = torch.abs(recon)
     gt_amp = torch.abs(gt)
     
     mse = F.mse_loss(recon_amp, gt_amp)
     
+    # Use fixed max_val for consistent PSNR calculation across batches
     if max_val is None:
-        max_val = torch.max(gt_amp)
+        max_val = 1.0  # Fixed reference value for SAR amplitude data
     
     if mse == 0:
         return float('inf')
     
-    psnr = 20 * torch.log10(max_val / torch.sqrt(mse))
+    psnr = 20 * torch.log10(torch.tensor(max_val) / torch.sqrt(mse))
     return psnr.item()
+
+
+def calculate_psnr_dual_pol(recon: torch.Tensor, gt: torch.Tensor, max_val: Optional[float] = None) -> dict:
+    """Calculate PSNR for both VV and VH polarizations separately."""
+    # Convert 4-channel real to complex
+    recon_vv = torch.complex(recon[:, 0], recon[:, 1])
+    recon_vh = torch.complex(recon[:, 2], recon[:, 3])
+    gt_vv = torch.complex(gt[:, 0], gt[:, 1])
+    gt_vh = torch.complex(gt[:, 2], gt[:, 3])
+    
+    recon_vv_amp = torch.abs(recon_vv)
+    recon_vh_amp = torch.abs(recon_vh)
+    gt_vv_amp = torch.abs(gt_vv)
+    gt_vh_amp = torch.abs(gt_vh)
+    
+    # Use fixed max_val for consistent PSNR calculation
+    if max_val is None:
+        max_val = 1.0
+    
+    # Calculate PSNR for each polarization
+    mse_vv = F.mse_loss(recon_vv_amp, gt_vv_amp)
+    mse_vh = F.mse_loss(recon_vh_amp, gt_vh_amp)
+    
+    psnr_vv = 20 * torch.log10(torch.tensor(max_val) / torch.sqrt(mse_vv + 1e-8))
+    psnr_vh = 20 * torch.log10(torch.tensor(max_val) / torch.sqrt(mse_vh + 1e-8))
+    psnr_avg = (psnr_vv + psnr_vh) / 2
+    
+    return {
+        'psnr_vv': psnr_vv.item(),
+        'psnr_vh': psnr_vh.item(),
+        'psnr_avg': psnr_avg.item()
+    }
 
 
 def calculate_ssim(recon: torch.Tensor, gt: torch.Tensor, window_size=11, sigma=1.5) -> float:
@@ -176,18 +212,28 @@ def calculate_cpif(recon: torch.Tensor, gt: torch.Tensor, reduction: str = 'mean
     recon, gt = _ensure_complex(recon), _ensure_complex(gt)
     """
     Calculate Complex Peak Intensity Factor. Assumes complex inputs.
+    Uses proper pixel-wise MSE calculation for accurate dB scaling.
     """
+    # Calculate pixel-wise complex MSE
     complex_mse = (recon.real - gt.real)**2 + (recon.imag - gt.imag)**2
+    
+    # Calculate mean MSE first, then apply logarithmic scaling
     if reduction == 'mean':
-        complex_mse = torch.mean(complex_mse)
+        mse_mean = torch.mean(complex_mse)
+    elif reduction == 'none':
+        mse_mean = complex_mse  # Keep per-pixel values
+    else:
+        raise ValueError(f"Unsupported reduction: {reduction}")
     
     gt_intensity = torch.abs(gt) ** 2
     peak_intensity = torch.max(gt_intensity)
     
-    if torch.all(complex_mse == 0):
+    if torch.all(mse_mean == 0):
         return torch.tensor(float('inf')).to(recon.device)
     
-    cpif = 10 * torch.log10(peak_intensity / (complex_mse + 1e-12))
+    # Apply logarithmic scaling to the averaged MSE for correct dB calculation
+    cpif = 10 * torch.log10(peak_intensity / (mse_mean + 1e-12))
+    
     return cpif
 
 
@@ -218,11 +264,12 @@ class MetricsCalculator:
         """Reset accumulated metrics"""
         self.metrics = {
             'loss': [], 'amp_loss': [], 'phase_loss': [], 'cpif_loss': [],
-            'psnr': [], 'ssim': [], 'cpif': [], 'rmse': [], 'phase_rmse': []
+            'psnr': [], 'psnr_vv': [], 'psnr_vh': [], 'psnr_avg': [],
+            'ssim': [], 'cpif': [], 'rmse': [], 'phase_rmse': []
         }
     
     def update(self, recon: torch.Tensor, gt: torch.Tensor, loss_components: Optional[dict] = None):
-        """Update metrics with new batch. Assumes complex inputs."""
+        """Update metrics with new batch. Assumes 4-channel real inputs for dual-pol."""
         with torch.no_grad():
             if loss_components is not None:
                 for key, value in loss_components.items():
@@ -230,14 +277,25 @@ class MetricsCalculator:
                         self.metrics[key] = []
                     self.metrics[key].append(value.item())
             
-            # Quality metrics
-            self.metrics['psnr'].append(calculate_psnr(recon, gt))
-            self.metrics['ssim'].append(calculate_ssim(recon, gt))
-            self.metrics['cpif'].append(calculate_cpif(recon, gt).item())
+            # Quality metrics - dual polarization
+            psnr_results = calculate_psnr_dual_pol(recon, gt)
+            self.metrics['psnr_vv'].append(psnr_results['psnr_vv'])
+            self.metrics['psnr_vh'].append(psnr_results['psnr_vh'])
+            self.metrics['psnr_avg'].append(psnr_results['psnr_avg'])
+            
+            # Backward compatibility - use VV PSNR for 'psnr' key
+            self.metrics['psnr'].append(psnr_results['psnr_vv'])
+            
+            # Convert to complex for other metrics (using _ensure_complex)
+            recon_complex = _ensure_complex(recon)
+            gt_complex = _ensure_complex(gt)
+            
+            self.metrics['ssim'].append(calculate_ssim(recon_complex, gt_complex))
+            self.metrics['cpif'].append(calculate_cpif(recon_complex, gt_complex).item())
             self.metrics['rmse'].append(calculate_rmse(recon, gt))
             
             # Phase statistics
-            phase_stats = calculate_phase_difference_stats(recon, gt)
+            phase_stats = calculate_phase_difference_stats(recon_complex, gt_complex)
             self.metrics['phase_rmse'].append(phase_stats['phase_rmse'])
     
     def get_average_metrics(self):
@@ -259,9 +317,14 @@ class MetricsCalculator:
         if 'loss' in avg_metrics:
             print(f"Loss: {avg_metrics['loss']:.6f} ± {avg_metrics['loss_std']:.6f}")
         
-        # Quality metrics
-        if 'psnr' in avg_metrics:
-            print(f"PSNR: {avg_metrics['psnr']:.2f} ± {avg_metrics['psnr_std']:.2f} dB")
+        # Quality metrics - dual polarization
+        if 'psnr_vv' in avg_metrics:
+            print(f"PSNR VV: {avg_metrics['psnr_vv']:.2f} ± {avg_metrics['psnr_vv_std']:.2f} dB")
+        if 'psnr_vh' in avg_metrics:
+            print(f"PSNR VH: {avg_metrics['psnr_vh']:.2f} ± {avg_metrics['psnr_vh_std']:.2f} dB")
+        if 'psnr_avg' in avg_metrics:
+            print(f"PSNR Avg: {avg_metrics['psnr_avg']:.2f} ± {avg_metrics['psnr_avg_std']:.2f} dB")
+        
         if 'ssim' in avg_metrics:
             print(f"SSIM: {avg_metrics['ssim']:.4f} ± {avg_metrics['ssim_std']:.4f}")
         if 'cpif' in avg_metrics:

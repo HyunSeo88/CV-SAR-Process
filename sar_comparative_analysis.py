@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import torch
 from pathlib import Path
 import warnings
+import pickle
 import argparse
 import sys
 from torch.utils.data import DataLoader
@@ -56,27 +57,58 @@ class SARImageAnalyzer:
             print(f"ERROR: Model checkpoint not found at {self.model_path}")
             sys.exit(1)
         
+        # Attempt to load the checkpoint. In PyTorch >= 2.6 the default is `weights_only=True`,
+        # which can break loading of older checkpoints created with `torch.save(model_state_dict)`.
+        # We first try the safe default and fall back to `weights_only=False` (unsafe) if necessary.
         try:
             checkpoint = torch.load(self.model_path, map_location=self.device)
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-                print(f"Loaded model from epoch {checkpoint.get('epoch', 'unknown')}")
+        except (RuntimeError, pickle.UnpicklingError) as e:
+            # Detect the specific PyTorch 2.6 "weights_only" failure mode
+            err_msg = str(e)
+            if "weights_only" in err_msg or "WeightsUnpickler" in err_msg or "weights only load failed" in err_msg.lower():
+                print("[WARN] Retrying model load with weights_only=False (unsafe, but required for legacy checkpoints).")
+                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
             else:
-                model.load_state_dict(checkpoint)
-                print("Loaded model state_dict directly.")
-        except Exception as e:
-            print(f"ERROR: Failed to load model weights from {self.model_path}. Error: {e}")
-            sys.exit(1)
+                print(f"ERROR: Failed to load model weights from {self.model_path}. Error: {e}")
+                sys.exit(1)
+
+        # Populate the network with the loaded weights
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Loaded model from epoch {checkpoint.get('epoch', 'unknown')}")
+        else:
+            model.load_state_dict(checkpoint)
+            print("Loaded model state_dict directly.")
         
         model.to(self.device)
         model.eval()
         return model
     
     def generate_super_resolved_images(self, lr_patches: torch.Tensor) -> torch.Tensor:
-        """Generate super-resolved images from low-resolution patches."""
+        """Generate super-resolved images from low-resolution patches.
+
+        The trained `ComplexUNet` expects 3 input channels:
+            0) VV real
+            1) VV imag
+            2) |VH| magnitude
+        However, the dataset currently returns 4 channels (VV-Re, VV-Im, VH-Re, VH-Im).
+        This helper converts the 4-channel representation to the expected 3-channel
+        format on-the-fly so we don't have to retrain or rewrite the dataset class.
+        """
         with torch.no_grad():
             lr_patches = lr_patches.to(self.device)
-            sr_patches = self.model(lr_patches)
+
+            # If we get 4 channels, convert to 3-channel layout expected by the model
+            if lr_patches.shape[1] == 4:
+                vv_real = lr_patches[:, 0:1, :, :]
+                vv_imag = lr_patches[:, 1:2, :, :]
+                # Add small epsilon inside sqrt for numerical stability
+                vh_mag = torch.sqrt(lr_patches[:, 2:3, :, :].pow(2) + lr_patches[:, 3:4, :, :].pow(2) + 1e-8)
+                model_input = torch.cat([vv_real, vv_imag, vh_mag], dim=1)
+            else:
+                model_input = lr_patches  # Already in correct shape
+
+            sr_patches = self.model(model_input)
             return sr_patches.cpu()
 
     def create_visual_comparison(self, sr_image: torch.Tensor, gt_image: torch.Tensor, sample_idx: int):
@@ -119,8 +151,14 @@ class SARImageAnalyzer:
         print("\n[SAR ANALYSIS] Starting SAR Image Visual Comparison")
         print("=" * 60)
         
+        # --- Find all files and create the dataset ---
+        all_files = sorted([str(p) for p in Path(data_dir).rglob("*.npy")])
+        if not all_files:
+            print(f"[ERROR] No SAR data (.npy files) found in {data_dir}. Check the path.")
+            return
+
         # Create dataset. Caching is disabled to prevent potential errors during analysis.
-        dataset = SARSuperResDataset(data_dir, split='test', use_cache=False)
+        dataset = SARSuperResDataset(file_list=all_files, data_dir=data_dir, use_cache=False)
         
         if len(dataset) == 0:
             print(f"[ERROR] No SAR data found in {data_dir}. Check the path.")
@@ -156,7 +194,7 @@ def main():
         description="Visual comparison of SAR SR images.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("--ckpt", default="model/cv_unet.pth", help="Path to trained model checkpoint.")
+    parser.add_argument("--ckpt", default="acswin_unet_pp.pth", help="Path to trained model checkpoint.")
     parser.add_argument("--patch-dir", required=True, help="Directory with SAR test patches.")
     parser.add_argument("--out-dir", default="./sar_comparison_results", help="Directory for output images.")
     parser.add_argument("--num-samples", type=int, default=5, help="Number of samples to compare.")
