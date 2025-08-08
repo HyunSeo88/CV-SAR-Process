@@ -17,7 +17,9 @@ PW    = getpass.getpass("Copernicus Password: ")
 
 # 1. 텍스트 원본 → SAFE 이름만 추출
 text_block = """
-S1B_IW_SLC__1SDV_20200825T213135_20200825T213203_023085_02BD50_0B18.SAFE
+S1A_IW_SLC__1SDV_20220809T093224_20220809T093250_044474_054EA8_9C90.SAFE
+and
+S1A_IW_SLC__1SDV_20220809T093158_20220809T093226_044474_054EA8_AB43.SAFE
 """
 safe_list = re.findall(r"S1[AB]_IW_SLC__1SDV_\d{8}T\d{6}_\d{8}T\d{6}_[\dA-F]{6}_\w{6}_\w{4}\.SAFE",
                        text_block, re.IGNORECASE)
@@ -59,7 +61,7 @@ print(f"✅ UUID 확보: {len(name2uuid)} / {len(safe_list)}")
 # 4. 다운로드
 ZIPPER = ("https://zipper.dataspace.copernicus.eu/odata/v1/"
           "Products({})/$value")
-out_dir = pathlib.Path("S1_raw")
+out_dir = pathlib.Path(r"D:/Sentinel-1/data/S1_raw")
 out_dir.mkdir(exist_ok=True)
 
 for safe, uid in name2uuid.items():

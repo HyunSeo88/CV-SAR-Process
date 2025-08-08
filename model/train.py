@@ -624,13 +624,7 @@ def train_model(
     
     # Setup optimizer and scheduler for better convergence
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = sched.ReduceLROnPlateau(
-        optimizer, 'min', 
-        patience=3,      # Reduce LR after 3 epochs without improvement
-        factor=0.5,      # Reduce LR by half
-        min_lr=1e-6      # Minimum learning rate
-
-    )
+    scheduler = sched.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-7)
     
     # PERF: Setup AMP scaler
     scaler = GradScaler()
@@ -701,8 +695,8 @@ def train_model(
             history['train_psnr'].append(train_avg_metrics.get('psnr', 0))
             history['val_psnr'].append(val_avg_metrics.get('psnr', 0))
             
-            # Step scheduler based on validation loss
-            scheduler.step(val_loss)
+            # Step scheduler (CosineAnnealingLR doesn't need validation loss)
+            scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
             
             # Log to TensorBoard
@@ -909,7 +903,7 @@ if __name__ == "__main__":
         'data_dir': r"D:\Sentinel-1\data\patches\zero_filtered",
         'model_save_path': r"D:\Sentinel-1\model\acswin_unet_pp.pth",
         'num_epochs': 100,  # Increased from 50 for better convergence
-        'batch_size': 64,   # Increased from 24 to 32 for better convergence
+        'batch_size': 32,   # Increased from 24 to 32 for better convergence
         'learning_rate': 1e-4,
         'early_stop_patience': 10,  # Increased patience for longer training
         'early_stop_threshold': 1e-4,

@@ -40,10 +40,10 @@ class PerceptualLoss(nn.Module):
         for p in self.vgg.parameters():
             p.requires_grad = False
     
-    def forward(self, recon, gt):
-        # Convert real-valued 4-channel tensor to complex for magnitude calculation
-        recon_complex = torch.complex(recon[:, 0], recon[:, 1])
-        gt_complex = torch.complex(gt[:, 0], gt[:, 1])
+    def forward(self, recon_single_pol, gt_single_pol):
+        # Input shape: (B, 2, H, W) -> [Real, Imag]
+        recon_complex = torch.complex(recon_single_pol[:, 0], recon_single_pol[:, 1])
+        gt_complex = torch.complex(gt_single_pol[:, 0], gt_single_pol[:, 1])
         
         # Calculate magnitude and ensure it's 4D: (B, 1, H, W)
         recon_mag = torch.abs(recon_complex).unsqueeze(1)
@@ -83,9 +83,9 @@ def sr_loss(recon, gt, perceptual=None):
     gt_vv = torch.complex(gt[:, 0], gt[:, 1])
     gt_vh = torch.complex(gt[:, 2], gt[:, 3])
     
-    # 1. Amplitude Loss (L1) for both polarizations
-    amp_loss_vv = F.l1_loss(torch.abs(recon_vv), torch.abs(gt_vv))
-    amp_loss_vh = F.l1_loss(torch.abs(recon_vh), torch.abs(gt_vh))
+    # 1. Amplitude Loss (MSE) for both polarizations
+    amp_loss_vv = F.mse_loss(torch.abs(recon_vv), torch.abs(gt_vv))
+    amp_loss_vh = F.mse_loss(torch.abs(recon_vh), torch.abs(gt_vh))
     amp_loss = amp_weight * (amp_loss_vv + amp_loss_vh)
     
     # 2. Phase Loss (L1) for both polarizations
@@ -93,11 +93,15 @@ def sr_loss(recon, gt, perceptual=None):
     phase_loss_vh = F.l1_loss(torch.angle(recon_vh), torch.angle(gt_vh))
     phase_loss = phase_weight * (phase_loss_vv + phase_loss_vh)
     
-    # 3. Perceptual Loss (optional) - uses VV polarization for compatibility with VGG
+    # 3. Perceptual Loss (optional) - applied to both VV and VH polarizations
     p_loss = 0
     if perceptual is not None:
-        # Pass the ORIGINAL 4-channel real tensors to perceptual loss
-        p_loss = perceptual_weight * perceptual(recon, gt)
+        # VV 편파 (채널 0, 1)에 대한 Perceptual Loss
+        p_loss_vv = perceptual(recon[:, :2], gt[:, :2])
+        # VH 편파 (채널 2, 3)에 대한 Perceptual Loss
+        p_loss_vh = perceptual(recon[:, 2:], gt[:, 2:])
+        # 두 손실을 평균내어 최종 Perceptual Loss 계산
+        p_loss = perceptual_weight * (p_loss_vv + p_loss_vh)
     
     # Total loss
     total_loss = amp_loss + phase_loss + p_loss
@@ -149,7 +153,7 @@ def calculate_psnr(recon: torch.Tensor, gt: torch.Tensor, max_val: Optional[floa
     return psnr.item()
 
 
-def calculate_psnr_dual_pol(recon: torch.Tensor, gt: torch.Tensor, max_val: Optional[float] = None) -> dict:
+def calculate_psnr_dual_pol(recon: torch.Tensor, gt: torch.Tensor) -> dict:
     """Calculate PSNR for both VV and VH polarizations separately."""
     # Convert 4-channel real to complex
     recon_vv = torch.complex(recon[:, 0], recon[:, 1])
@@ -162,16 +166,19 @@ def calculate_psnr_dual_pol(recon: torch.Tensor, gt: torch.Tensor, max_val: Opti
     gt_vv_amp = torch.abs(gt_vv)
     gt_vh_amp = torch.abs(gt_vh)
     
-    # Use fixed max_val for consistent PSNR calculation
-    if max_val is None:
-        max_val = 1.0
+    # Use max value from ground truth for PSNR calculation
+    max_val_vv = gt_vv_amp.max()
+    max_val_vh = gt_vh_amp.max()
     
     # Calculate PSNR for each polarization
     mse_vv = F.mse_loss(recon_vv_amp, gt_vv_amp)
     mse_vh = F.mse_loss(recon_vh_amp, gt_vh_amp)
     
-    psnr_vv = 20 * torch.log10(torch.tensor(max_val) / torch.sqrt(mse_vv + 1e-8))
-    psnr_vh = 20 * torch.log10(torch.tensor(max_val) / torch.sqrt(mse_vh + 1e-8))
+    # 0으로 나누는 것을 방지하기 위해 작은 값(epsilon) 추가
+    epsilon = 1e-9
+    
+    psnr_vv = 20 * torch.log10(max_val_vv / torch.sqrt(mse_vv + epsilon))
+    psnr_vh = 20 * torch.log10(max_val_vh / torch.sqrt(mse_vh + epsilon))
     psnr_avg = (psnr_vv + psnr_vh) / 2
     
     return {
@@ -179,7 +186,6 @@ def calculate_psnr_dual_pol(recon: torch.Tensor, gt: torch.Tensor, max_val: Opti
         'psnr_vh': psnr_vh.item(),
         'psnr_avg': psnr_avg.item()
     }
-
 
 def calculate_ssim(recon: torch.Tensor, gt: torch.Tensor, window_size=11, sigma=1.5) -> float:
     """Calculate Structural Similarity Index for amplitude. Assumes complex inputs."""

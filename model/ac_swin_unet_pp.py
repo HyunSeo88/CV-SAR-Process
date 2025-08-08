@@ -94,11 +94,19 @@ class ComplexPixelShuffle(nn.Module):
 class ComplexSE(nn.Module):
     def __init__(self, c: int, r: int = 16):
         super().__init__()
+        
+        # ★★★★★ 핵심 수정 사항 ★★★★★
+        # 채널 수가 r보다 작아져 0이 되는 것을 방지합니다.
+        squeezed_ch = max(1, c // r)
+        
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c, c//r, 1, bias=False), nn.ReLU(inplace=True),
-            nn.Conv2d(c//r, c, 1, bias=False), nn.Sigmoid()
+            nn.Conv2d(c, squeezed_ch, 1, bias=False), # c//r -> squeezed_ch
+            nn.ReLU(inplace=True),
+            nn.Conv2d(squeezed_ch, c, 1, bias=False), # c//r -> squeezed_ch
+            nn.Sigmoid()
         )
+    
     def forward(self, x):
         return x * self.se(torch.abs(x))
 
@@ -247,18 +255,19 @@ class ACSwinUNetPP(nn.Module):
         self.enc3 = EncBlock(base_dim*2, base_dim*4)
         blocks: List[nn.Module] = []
         for i in range(depth):
-            blocks.append(SwinBlock(base_dim*4, heads, win=(16,8), stride=(8,4), shift=(i%2==1)))
+            blocks.append(SwinBlock(base_dim*4, heads, win=(8,4), stride=(4,2), shift=(i%2==1)))
         self.bottleneck = nn.Sequential(*blocks)
-        # Three decoder layers to match three encoder layers + additional upsampling for 4x SR
+        # Three decoder layers to match three encoder layers
         self.dec3 = DecBlock(base_dim*4, base_dim*2, scale=(2,2), skip_ch=base_dim*2)  # 1/8 -> 1/4, skip e2 
         self.dec2 = DecBlock(base_dim*2, base_dim, scale=(2,2), skip_ch=base_dim)      # 1/4 -> 1/2, skip e1
         self.dec1 = DecBlock(base_dim, base_dim//2, scale=(2,2), skip_ch=0)           # 1/2 -> 1/1, no skip
-        # Additional 4x upsampling layer for super-resolution
-        self.super_res = ComplexPixelShuffle(base_dim//2, base_dim//4, scale=(4,4))
-        self.final = nn.Sequential(
-            ComplexConv2d(base_dim//4, base_dim//8, 3,1,1), ComplexGELU(),
-            ComplexConv2d(base_dim//8, 2, 1,1,0)
-        )
+        # Staged upsampling for super-resolution to reduce grid artifacts
+        # 1/1 -> 2x resolution
+        self.up1 = DecBlock(base_dim//2, base_dim//4, scale=(2,2), skip_ch=0)
+        # 2x -> 4x resolution
+        self.up2 = DecBlock(base_dim//4, base_dim//8, scale=(2,2), skip_ch=0)
+        # Final output layer
+        self.final = ComplexConv2d(base_dim//8, 2, 3, 1, 1)
     def _real4_to_c2(self,x:torch.Tensor):
         vv = torch.complex(x[:,0],x[:,1]); vh = torch.complex(x[:,2],x[:,3])
         return torch.stack([vv,vh],1)
@@ -275,13 +284,14 @@ class ACSwinUNetPP(nn.Module):
         d3 = self.dec3(b, e2)      # 1/4 resolution, skip from e2 (same resolution after upsampling)
         d2 = self.dec2(d3, e1)     # 1/2 resolution, skip from e1 (same resolution after upsampling)  
         d1 = self.dec1(d2, None)   # 1/1 resolution, no skip connection
-        # Super-resolution upsampling (4x)
-        sr = self.super_res(d1)    # 4x resolution, base_dim//4 channels
-        out = self.final(sr)       # 4x resolution, 2 complex channels
-        # Residual connection with properly upsampled input
+        # Staged super-resolution upsampling (2x + 2x = 4x total)
+        sr1 = self.up1(d1, None)   # 2x resolution
+        sr2 = self.up2(sr1, None)  # 4x resolution
+        out = self.final(sr2)      # 4x resolution, 2 complex channels
+        # Residual connection with scaled output for training stability
         residual_real = F.interpolate(x, size=out.shape[-2:], mode='bilinear', align_corners=False)
         residual = self._real4_to_c2(residual_real)
-        out = out + residual
+        out = out * 0.1 + residual
         return self._c2_to_real4(out)
 
 
