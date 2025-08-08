@@ -35,7 +35,7 @@ warnings.filterwarnings('ignore')
 sys.path.append(str(Path(__file__).parent.parent / 'model'))
 
 try:
-    from ac_swin_unet_pp import ACSwinUNetPP
+    from ac_swin_unet_pp import create_model as create_swin_model
     from cv_unet import ComplexUNet
 except ImportError as e:
     print(f"Warning: Could not import model modules: {e}")
@@ -56,7 +56,7 @@ def load_model(model_path: Path, model_type: str = 'swin_unet', device: str = 'c
     device = torch.device(device)
     
     if model_type == 'swin_unet':
-        model = ACSwinUNetPP()
+        model = create_swin_model()
     elif model_type == 'cv_unet':
         model = ComplexUNet()
     else:
@@ -92,72 +92,67 @@ def preprocess_data(data: np.ndarray, device: str = 'cpu', model_type: str = 'sw
     Preprocess input data for model inference.
     
     Args:
-        data: Input data with shape (2, H, W) for complex SAR data
+        data: Input data with shape (2, H, W) for complex64 SAR data
         device: Device to put tensor on
         model_type: Type of model to determine input format
         
     Returns:
         Preprocessed tensor ready for model input
     """
-    # Convert to torch tensor
-    if isinstance(data, np.ndarray):
-        data = torch.from_numpy(data).float()
+    # Validate input data
+    if data.shape[0] != 2:
+        raise ValueError(f"Expected data with shape (2, H, W), got {data.shape}")
     
-    # Ensure correct shape and type
-    if data.dim() == 3:
-        # Add batch dimension if needed
-        data = data.unsqueeze(0)
-    
-    # Move to device
-    data = data.to(device)
+    if data.dtype != np.complex64:
+        raise ValueError(f"Expected complex64 data, got {data.dtype}")
     
     # Model-specific preprocessing
     if model_type == 'swin_unet':
         # ACSwinUNetPP expects 4-channel real input (VV-Re, VV-Im, VH-Re, VH-Im)
-        # Convert from 2-channel real to 4-channel real
-        if data.shape[1] == 2:  # (B, 2, H, W) real
-            # Assume first channel is VV, second channel is VH
-            # For now, treat both as VV (you may need to adjust this based on your data)
-            vv_real = data[:, 0]  # (B, H, W) real
-            vh_real = data[:, 1]  # (B, H, W) real
-            
-            # Create 4-channel real data (VV-Re, VV-Im, VH-Re, VH-Im)
-            # For real data, imaginary parts are zero
-            real_data = torch.stack([
-                vv_real,           # VV-Re
-                torch.zeros_like(vv_real),  # VV-Im (zero for real data)
-                vh_real,           # VH-Re
-                torch.zeros_like(vh_real)   # VH-Im (zero for real data)
-            ], dim=1)  # (B, 4, H, W)
-            
-            return real_data
-        else:
-            return data
+        # Convert from complex SAR data to 4-channel real
+        vv_complex = data[0]  # VV polarization
+        vh_complex = data[1]  # VH polarization
+        
+        # Create 4-channel real data
+        real_data = np.stack([
+            vv_complex.real,  # VV-Re
+            vv_complex.imag,  # VV-Im
+            vh_complex.real,  # VH-Re
+            vh_complex.imag   # VH-Im
+        ], axis=0)  # (4, H, W)
+        
+        # Convert to tensor and add batch dimension
+        tensor = torch.from_numpy(real_data).float().unsqueeze(0).to(device)  # (1, 4, H, W)
+        return tensor
+        
     elif model_type == 'cv_unet':
-        # ComplexUNet expects 3-channel real input
-        if data.shape[1] == 2:  # (B, 2, H, W) real
-            # Convert to 3-channel real (magnitude, real, imaginary)
-            # For real data, treat first channel as magnitude, second as real part
-            magnitude = torch.abs(data[:, 0])
-            real_part = data[:, 0]
-            imag_part = data[:, 1]  # Use second channel as imaginary part
-            
-            real_data = torch.stack([magnitude, real_part, imag_part], dim=1)  # (B, 3, H, W)
-            return real_data
-        else:
-            return data
+        # ComplexUNet expects different format - keeping original logic for compatibility
+        # Convert complex to real representation
+        vv_complex = data[0]
+        vh_complex = data[1]
+        
+        # Use magnitude and components
+        magnitude = np.abs(vv_complex)
+        real_part = vv_complex.real
+        imag_part = vv_complex.imag
+        
+        real_data = np.stack([magnitude, real_part, imag_part], axis=0)  # (3, H, W)
+        tensor = torch.from_numpy(real_data).float().unsqueeze(0).to(device)  # (1, 3, H, W)
+        return tensor
+    
     else:
-        return data
+        raise ValueError(f"Unknown model type: {model_type}")
 
-def postprocess_data(output: torch.Tensor) -> np.ndarray:
+def postprocess_data(output: torch.Tensor, model_type: str = 'swin_unet') -> np.ndarray:
     """
     Postprocess model output to get final result.
     
     Args:
         output: Model output tensor
+        model_type: Type of model to determine output format
         
     Returns:
-        Processed numpy array
+        Processed numpy array with shape (2, H, W) complex64 for SAR data
     """
     # Remove batch dimension if present
     if output.dim() == 4:
@@ -166,9 +161,25 @@ def postprocess_data(output: torch.Tensor) -> np.ndarray:
     # Convert to numpy
     output = output.detach().cpu().numpy()
     
-    # Model outputs 4-channel real data (VV-Re, VV-Im, VH-Re, VH-Im)
-    # This is the correct format for SAR data
-    return output
+    if model_type == 'swin_unet':
+        # Model outputs 4-channel real data (VV-Re, VV-Im, VH-Re, VH-Im)
+        # Convert back to complex SAR format (2, H, W) complex64
+        if output.shape[0] == 4:
+            vv_complex = output[0] + 1j * output[1]  # VV-Re + j*VV-Im
+            vh_complex = output[2] + 1j * output[3]  # VH-Re + j*VH-Im
+            
+            complex_output = np.stack([vv_complex, vh_complex], axis=0).astype(np.complex64)
+            return complex_output
+        else:
+            print(f"Warning: Expected 4-channel output, got {output.shape[0]} channels")
+            return output.astype(np.complex64)
+    
+    elif model_type == 'cv_unet':
+        # ComplexUNet output processing (adjust based on actual output format)
+        return output.astype(np.complex64)
+    
+    else:
+        return output.astype(np.complex64)
 
 def apply_sr_model(model: torch.nn.Module, input_data: np.ndarray, 
                    device: str = 'cpu', model_type: str = 'swin_unet') -> np.ndarray:
@@ -192,7 +203,7 @@ def apply_sr_model(model: torch.nn.Module, input_data: np.ndarray,
         output = model(input_tensor)
     
     # Postprocess
-    output_data = postprocess_data(output)
+    output_data = postprocess_data(output, model_type)
     
     return output_data
 
@@ -218,7 +229,11 @@ def process_single_file(input_path: Path, output_path: Path, model: torch.nn.Mod
         if input_data.ndim != 3 or input_data.shape[0] != 2:
             raise ValueError(f"Expected 3D array with shape (2, H, W), got {input_data.shape}")
         
-        print(f"Input shape: {input_data.shape}")
+        if input_data.dtype != np.complex64:
+            print(f"Warning: Expected complex64 data, got {input_data.dtype}. Converting...")
+            input_data = input_data.astype(np.complex64)
+        
+        print(f"Input shape: {input_data.shape}, dtype: {input_data.dtype}")
         
         # Apply SR model
         output_data = apply_sr_model(model, input_data, device, model_type)

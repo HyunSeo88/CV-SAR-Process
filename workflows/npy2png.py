@@ -34,6 +34,8 @@ def load_npy_file(file_path: Path) -> np.ndarray:
         data = np.load(file_path)
         if data.shape[0] not in [2, 4]:
             raise ValueError(f"Invalid shape {data.shape}. Expected (2, H, W) or (4, H, W).")
+        
+        print(f"Loaded data: shape={data.shape}, dtype={data.dtype}")
         return data
     except Exception as e:
         print(f"Error loading {file_path}: {e}")
@@ -58,12 +60,24 @@ def visualize_complex_data(data: np.ndarray, mode: str = 'amplitude', colormap: 
             
     elif data.shape[0] == 2:
         # 2-channel data - assume it's dual-pol complex: VV and VH
-        if polarization.upper() == 'VV':
-            complex_data = data[0]
-        elif polarization.upper() == 'VH':
-            complex_data = data[1]
+        # Each channel should already be complex (complex64)
+        if data.dtype == np.complex64 or data.dtype == np.complex128:
+            # Data is already complex
+            if polarization.upper() == 'VV':
+                complex_data = data[0]
+            elif polarization.upper() == 'VH':
+                complex_data = data[1]
+            else:
+                raise ValueError(f"Invalid polarization: {polarization}. Use 'VV' or 'VH'")
         else:
-            raise ValueError(f"Invalid polarization: {polarization}. Use 'VV' or 'VH'")
+            # Data is real - treat as separate real channels (legacy support)
+            print(f"Warning: 2-channel real data detected. Expected complex data.")
+            if polarization.upper() == 'VV':
+                complex_data = data[0]  # Use first channel as real data
+            elif polarization.upper() == 'VH':
+                complex_data = data[1]  # Use second channel as real data
+            else:
+                raise ValueError(f"Invalid polarization: {polarization}. Use 'VV' or 'VH'")
     else:
         raise ValueError(f"Unsupported data shape: {data.shape}")
     
