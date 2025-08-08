@@ -61,60 +61,109 @@ class PerceptualLoss(nn.Module):
         return F.mse_loss(recon_features, gt_features)
 
 
+def _charbonnier(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    return torch.sqrt(x * x + eps * eps)
+
+
+def _tv_l1(x: torch.Tensor) -> torch.Tensor:
+    dy = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]).mean()
+    dx = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]).mean()
+    return dx + dy
+
+
 def sr_loss(recon, gt, perceptual=None):
     """
-    Computes SR loss: combination of amplitude, phase, and optional perceptual loss for both VV and VH polarizations.
+    Phase-preserving SR loss set for dual-pol SAR (VV, VH):
+    - Log-amplitude Charbonnier (multiplicative speckle friendly)
+    - Circular phase loss: 1 - cos(Δφ)
+    - Complex L1 on (Real, Imag)
+    - FFT(Amplitude) spectrum L1 to suppress grid frequencies
+    - Small TV on amplitude
+    - Optional perceptual (amplitude-only, small weight)
     
     Args:
-        recon: Reconstructed 4-channel real tensor (B, 4, H, W) - [VV-Re, VV-Im, VH-Re, VH-Im]
-        gt: Ground truth 4-channel real tensor (B, 4, H, W) - [VV-Re, VV-Im, VH-Re, VH-Im]
-        perceptual: PerceptualLoss instance
-        
+        recon: (B, 4, H, W) real tensor [VV-Re, VV-Im, VH-Re, VH-Im]
+        gt:    (B, 4, H, W) real tensor
+        perceptual: Optional PerceptualLoss (amplitude-only)
     Returns:
-        Dictionary of loss components
+        Dict of loss components
     """
-    # loss weights
-    amp_weight = 0.5
-    phase_weight = 0.3
-    perceptual_weight = 0.05
-    # Convert to complex for both VV and VH polarizations
+    # Weights (phase preservation first)
+    w_log_amp = 0.45
+    w_phase = 0.40
+    w_cplx_l1 = 0.10
+    w_fft = 0.03
+    w_tv = 1e-3
+    w_perc = 0.02  # amplitude-only perceptual
+
+    # Convert to complex
     recon_vv = torch.complex(recon[:, 0], recon[:, 1])
     recon_vh = torch.complex(recon[:, 2], recon[:, 3])
     gt_vv = torch.complex(gt[:, 0], gt[:, 1])
     gt_vh = torch.complex(gt[:, 2], gt[:, 3])
-    
-    # 1. Amplitude Loss (MSE) for both polarizations
-    amp_loss_vv = F.mse_loss(torch.abs(recon_vv), torch.abs(gt_vv))
-    amp_loss_vh = F.mse_loss(torch.abs(recon_vh), torch.abs(gt_vh))
-    amp_loss = amp_weight * (amp_loss_vv + amp_loss_vh)
-    
-    # 2. Phase Loss (L1) for both polarizations
-    phase_loss_vv = F.l1_loss(torch.angle(recon_vv), torch.angle(gt_vv))
-    phase_loss_vh = F.l1_loss(torch.angle(recon_vh), torch.angle(gt_vh))
-    phase_loss = phase_weight * (phase_loss_vv + phase_loss_vh)
-    
-    # 3. Perceptual Loss (optional) - applied to both VV and VH polarizations
-    p_loss = 0
+
+    # Amplitudes and phases
+    amp_r_vv = torch.abs(recon_vv)
+    amp_r_vh = torch.abs(recon_vh)
+    amp_g_vv = torch.abs(gt_vv)
+    amp_g_vh = torch.abs(gt_vh)
+
+    phase_r_vv = torch.angle(recon_vv)
+    phase_r_vh = torch.angle(recon_vh)
+    phase_g_vv = torch.angle(gt_vv)
+    phase_g_vh = torch.angle(gt_vh)
+
+    # 1) Log-amplitude Charbonnier
+    log_r_vv = torch.log(amp_r_vv + 1e-8)
+    log_g_vv = torch.log(amp_g_vv + 1e-8)
+    log_r_vh = torch.log(amp_r_vh + 1e-8)
+    log_g_vh = torch.log(amp_g_vh + 1e-8)
+    log_amp_charb_vv = _charbonnier(log_r_vv - log_g_vv).mean()
+    log_amp_charb_vh = _charbonnier(log_r_vh - log_g_vh).mean()
+    log_amp_loss = w_log_amp * (log_amp_charb_vv + log_amp_charb_vh)
+
+    # 2) Circular phase loss: 1 - cos(Δφ)
+    dphi_vv = phase_r_vv - phase_g_vv
+    dphi_vh = phase_r_vh - phase_g_vh
+    phase_loss_vv = (1 - torch.cos(dphi_vv)).mean()
+    phase_loss_vh = (1 - torch.cos(dphi_vh)).mean()
+    phase_loss = w_phase * (phase_loss_vv + phase_loss_vh)
+
+    # 3) Complex L1 on (real, imag)
+    cplx_l1_vv = F.l1_loss(recon_vv.real, gt_vv.real) + F.l1_loss(recon_vv.imag, gt_vv.imag)
+    cplx_l1_vh = F.l1_loss(recon_vh.real, gt_vh.real) + F.l1_loss(recon_vh.imag, gt_vh.imag)
+    cplx_l1 = w_cplx_l1 * (cplx_l1_vv + cplx_l1_vh)
+
+    # 4) FFT (amplitude) spectrum L1
+    def amp_fft_l1(a_pred: torch.Tensor, a_gt: torch.Tensor) -> torch.Tensor:
+        Fp = torch.fft.rfft2(a_pred.float())
+        Fg = torch.fft.rfft2(a_gt.float())
+        return torch.mean(torch.abs(torch.abs(Fp) - torch.abs(Fg)))
+    fft_loss = w_fft * (amp_fft_l1(amp_r_vv, amp_g_vv) + amp_fft_l1(amp_r_vh, amp_g_vh))
+
+    # 5) Tiny TV on amplitude
+    amp_stack = torch.stack([amp_r_vv, amp_r_vh], dim=1)  # (B,2,H,W)
+    tv_loss = w_tv * _tv_l1(amp_stack)
+
+    # 6) Perceptual (amplitude-only) - small weight
+    p_loss = torch.tensor(0.0, device=recon.device)
     if perceptual is not None:
-        # VV 편파 (채널 0, 1)에 대한 Perceptual Loss
-        p_loss_vv = perceptual(recon[:, :2], gt[:, :2])
-        # VH 편파 (채널 2, 3)에 대한 Perceptual Loss
-        p_loss_vh = perceptual(recon[:, 2:], gt[:, 2:])
-        # 두 손실을 평균내어 최종 Perceptual Loss 계산
-        p_loss = perceptual_weight * (p_loss_vv + p_loss_vh)
-    
-    # Total loss
-    total_loss = amp_loss + phase_loss + p_loss
-    
+        p_vv = perceptual(recon[:, :2], gt[:, :2])
+        p_vh = perceptual(recon[:, 2:], gt[:, 2:])
+        p_loss = w_perc * (p_vv + p_vh)
+
+    total_loss = log_amp_loss + phase_loss + cplx_l1 + fft_loss + tv_loss + p_loss
+
     return {
         'total_loss': total_loss,
-        'amp_loss': amp_loss,
-        'amp_loss_vv': amp_loss_vv,
-        'amp_loss_vh': amp_loss_vh,
+        'log_amp_loss': log_amp_loss,
         'phase_loss': phase_loss,
-        'phase_loss_vv': phase_loss_vv,
-        'phase_loss_vh': phase_loss_vh,
-        'perceptual_loss': p_loss
+        'phase_loss_vv': w_phase * phase_loss_vv,
+        'phase_loss_vh': w_phase * phase_loss_vh,
+        'complex_l1': cplx_l1,
+        'fft_loss': fft_loss,
+        'tv_loss': tv_loss,
+        'perceptual_loss': p_loss,
     }
 
 

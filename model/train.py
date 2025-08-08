@@ -256,6 +256,34 @@ def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0
     else:
         print("Scanning for all .npy files and creating new train/val/test splits...")
         all_files = list(Path(data_dir).rglob(pattern))
+        # 1) Filter out cached/low-res or generated directories that should not be treated as HR
+        def is_valid_hr_path(p: Path) -> bool:
+            blocklist = {"lr_cache", "LR", "SR"}
+            parts = {str(x) for x in p.parts}
+            return not bool(parts & blocklist)
+        before = len(all_files)
+        all_files = [p for p in all_files if is_valid_hr_path(p)]
+        after_dir = len(all_files)
+        if after_dir < before:
+            print(f"Filtered {before - after_dir} by directory name (excluded lr_cache/LR/SR)")
+
+        # 2) Keep only files whose stored array shape matches HR size (or transposed)
+        hr_h, hr_w = 512, 256
+        valid_files = []
+        bad_shape = 0
+        for p in all_files:
+            try:
+                arr = np.load(p, mmap_mode='r')
+                if arr.shape == (2, hr_h, hr_w) or arr.shape == (2, hr_w, hr_h):
+                    valid_files.append(p)
+                else:
+                    bad_shape += 1
+            except Exception:
+                bad_shape += 1
+                continue
+        if bad_shape:
+            print(f"Filtered {bad_shape} by shape (kept HR-sized only)")
+        all_files = valid_files
         
         # Limit samples if specified
         if max_samples is not None and max_samples < len(all_files):
@@ -470,8 +498,8 @@ def log_images_to_tensorboard(writer, raw_batch, lr_batch, hr_batch, pred_batch,
     # This does not affect training, only what's shown on TensorBoard.
     raw_amp_vv_up = F.interpolate(raw_amp_vv.unsqueeze(1), size=hr_size, mode='bilinear', align_corners=False).squeeze(1)
     raw_amp_vh_up = F.interpolate(raw_amp_vh.unsqueeze(1), size=hr_size, mode='bilinear', align_corners=False).squeeze(1)
-    lr_amp_vv_up = F.interpolate(lr_amp_vv.unsqueeze(1), size=hr_size, mode='nearest').squeeze(1)
-    lr_amp_vh_up = F.interpolate(lr_amp_vh.unsqueeze(1), size=hr_size, mode='nearest').squeeze(1)
+    lr_amp_vv_up = F.interpolate(lr_amp_vv.unsqueeze(1), size=hr_size, mode='bilinear', align_corners=False).squeeze(1)
+    lr_amp_vh_up = F.interpolate(lr_amp_vh.unsqueeze(1), size=hr_size, mode='bilinear', align_corners=False).squeeze(1)
 
     # --- 3. Normalize images with fixed dB range for consistency ---
     def normalize_for_display_fixed_range(amp_tensor, min_db, max_db):
@@ -481,10 +509,20 @@ def log_images_to_tensorboard(writer, raw_batch, lr_batch, hr_batch, pred_batch,
         norm_amp = (log_amp - min_db) / (max_db - min_db)
         # Add channel dimension and convert to uint8
         return (norm_amp.unsqueeze(1).clamp(0, 1) * 255).to(torch.uint8)
+    
+    def normalize_for_display_adaptive(amp_tensor):
+        # Adaptive normalization for individual tensor
+        log_amp = 20 * torch.log10(amp_tensor + 1e-8)
+        min_db = log_amp.min()
+        max_db = log_amp.max()
+        norm_amp = (log_amp - min_db) / (max_db - min_db + 1e-8)
+        return (norm_amp.unsqueeze(1).clamp(0, 1) * 255).to(torch.uint8)
 
     min_db, max_db = fixed_range
 
     # --- VV Polarization Visualization ---
+    # Note: LR_Input_Upscaled shows degraded version of HR (4x4 block averaging + bilinear upscale)
+    # It should appear blurred compared to Raw_HR due to information loss in LR generation
     writer.add_images('SAR_Images_VV/1_Raw_HR', normalize_for_display_fixed_range(raw_amp_vv_up, min_db, max_db), epoch)
     writer.add_images('SAR_Images_VV/2_LR_Input_Upscaled', normalize_for_display_fixed_range(lr_amp_vv_up, min_db, max_db), epoch)
     writer.add_images('SAR_Images_VV/3_HR_Target', normalize_for_display_fixed_range(hr_amp_vv, min_db, max_db), epoch)

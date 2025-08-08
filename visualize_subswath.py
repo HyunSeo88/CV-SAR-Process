@@ -41,7 +41,7 @@ class SARImageAnalyzer:
     def __init__(self, model_path: str, output_dir: str):
         self.model_path = model_path
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True, parents=True)
+        self.output_dir.mkdir(exist_ok=True, parents=True) 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = self._load_model()
 

@@ -50,6 +50,51 @@ class ComplexGELU(nn.Module):
         return x * (F.gelu(mag) / (mag + 1e-8))
 
 # ================================================================
+# Anti-aliased downsampling (BlurPool) for complex tensors
+# ================================================================
+
+def _create_blur_kernel(size: int = 5) -> torch.Tensor:
+    """Create a 2D binomial (approx Gaussian) blur kernel of given odd size."""
+    assert size % 2 == 1, "Blur kernel size must be odd"
+    if size == 3:
+        base = torch.tensor([1., 2., 1.])
+    elif size == 5:
+        base = torch.tensor([1., 4., 6., 4., 1.])
+    elif size == 7:
+        base = torch.tensor([1., 6., 15., 20., 15., 6., 1.])
+    else:
+        # Fallback to size 5 pattern for unsupported sizes
+        base = torch.tensor([1., 4., 6., 4., 1.])
+    kernel_1d = base / base.sum()
+    kernel_2d = torch.outer(kernel_1d, kernel_1d)
+    kernel_2d = kernel_2d / kernel_2d.sum()
+    return kernel_2d
+
+class ComplexBlurPool(nn.Module):
+    """
+    Depthwise blur + strided subsampling applied to real/imag separately.
+    This reduces aliasing before decimation.
+    """
+    def __init__(self, channels: int, kernel_size: int = 5, stride: Tuple[int, int] = (2, 2)):
+        super().__init__()
+        self.channels = channels
+        self.stride = stride
+        kernel = _create_blur_kernel(kernel_size).float()
+        # Register as buffer to move with module device/dtype
+        self.register_buffer('kernel', kernel[None, None, :, :])  # [1,1,kH,kW]
+        self.pad_h = kernel.shape[-2] // 2
+        self.pad_w = kernel.shape[-1] // 2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        real = F.pad(x.real, (self.pad_w, self.pad_w, self.pad_h, self.pad_h), mode='replicate')
+        imag = F.pad(x.imag, (self.pad_w, self.pad_w, self.pad_h, self.pad_h), mode='replicate')
+        # Depthwise: repeat kernel per channel
+        weight = self.kernel.repeat(self.channels, 1, 1, 1)  # [C,1,kH,kW]
+        real = F.conv2d(real, weight, stride=self.stride, groups=self.channels)
+        imag = F.conv2d(imag, weight, stride=self.stride, groups=self.channels)
+        return torch.complex(real, imag)
+
+# ================================================================
 # Complex PixelShuffle for upsampling
 # ================================================================
 
@@ -65,6 +110,29 @@ class ComplexPixelShuffle(nn.Module):
         
         total_scale = self.scale_h * self.scale_w
         self.conv = ComplexConv2d(in_c, out_c * total_scale, 3, 1, 1)
+        # ICNR initialization to reduce checkerboard artifacts
+        self._apply_icnr(total_scale)
+
+    def _icnr_(self, weight: torch.Tensor, scale_mul: int):
+        """In-place ICNR initialization for a real-valued conv weight.
+        weight shape: [out_c * scale_mul, in_c, kH, kW]
+        """
+        out_c, in_c, kH, kW = weight.shape
+        if out_c % scale_mul != 0:
+            # Fallback: kaiming normal if shape not divisible
+            nn.init.kaiming_normal_(weight)
+            return
+        new_shape = (out_c // scale_mul, in_c, kH, kW)
+        subkernel = torch.zeros(new_shape, device=weight.device, dtype=weight.dtype)
+        nn.init.kaiming_normal_(subkernel)
+        subkernel = subkernel.repeat_interleave(scale_mul, dim=0)
+        with torch.no_grad():
+            weight.copy_(subkernel)
+
+    def _apply_icnr(self, scale_mul: int):
+        # Apply ICNR on both real and imaginary conv weights
+        self._icnr_(self.conv.real.weight, scale_mul)
+        self._icnr_(self.conv.imag.weight, scale_mul)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Apply complex convolution
@@ -130,10 +198,13 @@ class ComplexSpatialAttn(nn.Module):
 class EncBlock(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
-        self.conv = ComplexConv2d(in_c, out_c, (7,3), (2,2), (3,1))  # Adjusted kernel and padding for (512,256) data
+        # Anti-aliased downsampling: blur + decimate, then stride-1 conv
+        self.blur = ComplexBlurPool(in_c, kernel_size=5, stride=(2, 2))
+        self.conv = ComplexConv2d(in_c, out_c, (7, 3), (1, 1), (3, 1))
         self.bn   = ComplexBN(out_c)
         self.act  = ComplexGELU()
     def forward(self,x):
+        x = self.blur(x)
         return self.act(self.bn(self.conv(x)))
 
 class DecBlock(nn.Module):
@@ -156,6 +227,38 @@ class DecBlock(nn.Module):
         x = self.up(x)
         if skip is not None:
             x = torch.cat([x,skip],1)
+        x = self.act(self.b1(self.c1(x)))
+        x = self.act(self.b2(self.c2(x)))
+        x = self.sa(self.se(x))
+        return x
+
+class DecBlockResize(nn.Module):
+    """Decoder block using bilinear resize + ComplexConv (anti-checkerboard)."""
+    def __init__(self, in_c, out_c, scale=(2, 2), skip_ch=None):
+        super().__init__()
+        self.scale = scale
+        # Calculate input channels for first conv: upsampled + skip features
+        if skip_ch is None or skip_ch == 0:
+            conv_in_ch = in_c  # After upsample, channels unchanged
+        else:
+            conv_in_ch = in_c + skip_ch
+        self.c1   = ComplexConv2d(conv_in_ch, out_c, 3,1,1)
+        self.b1   = ComplexBN(out_c)
+        self.c2   = ComplexConv2d(out_c, out_c, 3,1,1)
+        self.b2   = ComplexBN(out_c)
+        self.act  = ComplexGELU()
+        self.se   = ComplexSE(out_c)
+        self.sa   = ComplexSpatialAttn()
+
+    def _resize(self, x: torch.Tensor) -> torch.Tensor:
+        real = F.interpolate(x.real, scale_factor=self.scale, mode='bilinear', align_corners=False, antialias=True)
+        imag = F.interpolate(x.imag, scale_factor=self.scale, mode='bilinear', align_corners=False, antialias=True)
+        return torch.complex(real, imag)
+
+    def forward(self, x, skip):
+        x = self._resize(x)
+        if skip is not None:
+            x = torch.cat([x, skip], 1)
         x = self.act(self.b1(self.c1(x)))
         x = self.act(self.b2(self.c2(x)))
         x = self.sa(self.se(x))
@@ -262,10 +365,10 @@ class ACSwinUNetPP(nn.Module):
         self.dec2 = DecBlock(base_dim*2, base_dim, scale=(2,2), skip_ch=base_dim)      # 1/4 -> 1/2, skip e1
         self.dec1 = DecBlock(base_dim, base_dim//2, scale=(2,2), skip_ch=0)           # 1/2 -> 1/1, no skip
         # Staged upsampling for super-resolution to reduce grid artifacts
-        # 1/1 -> 2x resolution
-        self.up1 = DecBlock(base_dim//2, base_dim//4, scale=(2,2), skip_ch=0)
-        # 2x -> 4x resolution
-        self.up2 = DecBlock(base_dim//4, base_dim//8, scale=(2,2), skip_ch=0)
+        # 1/1 -> 2x resolution (resize-conv)
+        self.up1 = DecBlockResize(base_dim//2, base_dim//4, scale=(2,2), skip_ch=0)
+        # 2x -> 4x resolution (resize-conv)
+        self.up2 = DecBlockResize(base_dim//4, base_dim//8, scale=(2,2), skip_ch=0)
         # Final output layer
         self.final = ComplexConv2d(base_dim//8, 2, 3, 1, 1)
     def _real4_to_c2(self,x:torch.Tensor):
