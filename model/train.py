@@ -39,6 +39,13 @@ GradScaler = amp.GradScaler
 
 # Import utils always
 from utils import sr_loss, MetricsCalculator, PerceptualLoss
+
+# Provide a default model factory to satisfy static references; CLI may override at runtime
+try:
+    from ac_swin_unet_pp import create_model as _default_create_model
+    create_model = _default_create_model  # will be overridden in __main__ if needed
+except Exception:
+    create_model = None  # Will be set in __main__
 from data_cache import load_or_compute_lr
 # PERF: Import speed utils
 from speed_utils import get_optimal_workers, auto_adjust_batch_size, setup_profiler
@@ -105,11 +112,10 @@ class SARSuperResDataset(Dataset):
         scale = self.hr_size[0] // self.lr_size[0]      # ex. 4
         assert hr.shape[-2:] == self.hr_size, f"HR shape mismatch: got {hr.shape[-2:]}, expected {self.hr_size}"
 
-        # 1) 전력합 → √: divisor_override=1 로 ‘합’을 바로 계산
+        # 1) 평균 전력 → √: 물리적 스케일 정합을 위해 평균으로 다운샘플
         power = (hr.real**2 + hr.imag**2).unsqueeze(0)       # (1,2,H,W)
-        power_sum = F.avg_pool2d(power, scale, stride=scale,
-                             divisor_override=1)         # 합 = ∑|z|²
-        amp_lr = power_sum.sqrt().squeeze(0)                 # (2,H/4,W/4)
+        power_avg = F.avg_pool2d(power, scale, stride=scale) # 평균 = (1/|K|)∑|z|²
+        amp_lr = power_avg.sqrt().squeeze(0)                 # (2,H/4,W/4)
         
         # 2) 위상 평균
         phase = torch.angle(hr).unsqueeze(0)                    # (1,2,H,W)
@@ -307,7 +313,7 @@ def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0
     return train_loader, val_loader
 
 
-def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual, scaler, profiler=None):
+def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual, scaler, profiler=None, *, perceptual_weight: float = 0.0, fft_weight: float = 0.0):
     """
     Train for one epoch
     
@@ -345,7 +351,7 @@ def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual
                 hr_batch = hr_batch[..., :h, :w]
             
             # Calculate loss
-            loss_components = sr_loss(pred_hr.float(), hr_batch, perceptual)
+            loss_components = sr_loss(pred_hr.float(), hr_batch, perceptual, perceptual_weight=perceptual_weight, fft_weight=fft_weight)
             
             # Handle both dict (new) and tuple (old) formats
             if isinstance(loss_components, dict):
@@ -378,7 +384,7 @@ def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual
     return total_loss / max(total_samples, 1)
 
 
-def validate_epoch(model, val_loader, device, metrics_calc, perceptual):
+def validate_epoch(model, val_loader, device, metrics_calc, perceptual, *, perceptual_weight: float = 0.0, fft_weight: float = 0.0):
     """
     Validate for one epoch
     
@@ -416,7 +422,7 @@ def validate_epoch(model, val_loader, device, metrics_calc, perceptual):
                     hr_batch = hr_batch[..., :h, :w]
                 
                 # Calculate loss
-                loss_components = sr_loss(pred_hr.float(), hr_batch, perceptual)
+                loss_components = sr_loss(pred_hr.float(), hr_batch, perceptual, perceptual_weight=perceptual_weight, fft_weight=fft_weight)
                 
                 # Handle both dict (new) and tuple (old) formats
                 if isinstance(loss_components, dict):
@@ -603,6 +609,8 @@ def train_model(
     early_stop_threshold: float = 1e-4,
     enable_tensorboard: bool = True,
     enable_perceptual: bool = True,
+    perceptual_weight: float = 0.0,
+    fft_weight: float = 0.02,
     tensorboard_log_dir: str = None,
     profile_steps: int = 0,  # PERF: Added for profiling control
     *,
@@ -643,8 +651,10 @@ def train_model(
     model = create_model()
     model.to(device)
     
-    # Instantiate PerceptualLoss only when enabled
-    perceptual = PerceptualLoss().to(device) if enable_perceptual else None
+    # Instantiate PerceptualLoss only when enabled and weight > 0
+    perceptual = None
+    if enable_perceptual and perceptual_weight > 0.0:
+        perceptual = PerceptualLoss().to(device)
     
     # Log model architecture to TensorBoard (commented out due to trace errors)
     if writer:
@@ -750,12 +760,12 @@ def train_model(
             
             # Training
             print("Training...")
-            train_loss = train_epoch(model, train_loader, optimizer, device, train_metrics, perceptual, scaler, profiler)
+            train_loss = train_epoch(model, train_loader, optimizer, device, train_metrics, perceptual, scaler, profiler, perceptual_weight=perceptual_weight, fft_weight=fft_weight)
             train_avg_metrics = train_metrics.get_average_metrics()
             
             # Validation
             print("Validating...")
-            val_loss = validate_epoch(model, val_loader, device, val_metrics, perceptual)
+            val_loss = validate_epoch(model, val_loader, device, val_metrics, perceptual, perceptual_weight=perceptual_weight, fft_weight=fft_weight)
             val_avg_metrics = val_metrics.get_average_metrics()
             
             # Update history
@@ -806,6 +816,17 @@ def train_model(
                     with torch.no_grad():
                         pred_hr_sample = model(lr_batch_sample)
                     
+                    # Print amplitude min/max (scale sanity)
+                    with torch.no_grad():
+                        lr_vv = torch.hypot(lr_batch_sample[:, 0], lr_batch_sample[:, 1])
+                        hr_vv = torch.hypot(hr_batch_sample[:, 0], hr_batch_sample[:, 1])
+                        pr_vv = torch.hypot(pred_hr_sample[:, 0], pred_hr_sample[:, 1])
+                        lr_vh = torch.hypot(lr_batch_sample[:, 2], lr_batch_sample[:, 3])
+                        hr_vh = torch.hypot(hr_batch_sample[:, 2], hr_batch_sample[:, 3])
+                        pr_vh = torch.hypot(pred_hr_sample[:, 2], pred_hr_sample[:, 3])
+                        print(f"  VV amp min/max  - LR: {lr_vv.min().item():.4f}/{lr_vv.max().item():.4f}, HR: {hr_vv.min().item():.4f}/{hr_vv.max().item():.4f}, Pred: {pr_vv.min().item():.4f}/{pr_vv.max().item():.4f}")
+                        print(f"  VH amp min/max  - LR: {lr_vh.min().item():.4f}/{lr_vh.max().item():.4f}, HR: {hr_vh.min().item():.4f}/{hr_vh.max().item():.4f}, Pred: {pr_vh.min().item():.4f}/{pr_vh.max().item():.4f}")
+
                     # Log side-by-side LR → HR → SR (all from same source)
                     log_images_to_tensorboard(writer, lr_batch_sample, hr_batch_sample, pred_hr_sample, epoch, num_images=1)
                     log_complex_statistics(writer, hr_batch_sample, 'HR_Target', epoch)
@@ -830,6 +851,26 @@ def train_model(
             print(f"  Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
             print(f"  Train PSNR - VV: {train_avg_metrics.get('psnr_vv', 0):.2f} dB, VH: {train_avg_metrics.get('psnr_vh', 0):.2f} dB, Avg: {train_avg_metrics.get('psnr_avg', 0):.2f} dB")
             print(f"  Val PSNR - VV: {val_avg_metrics.get('psnr_vv', 0):.2f} dB, VH: {val_avg_metrics.get('psnr_vh', 0):.2f} dB, Avg: {val_avg_metrics.get('psnr_avg', 0):.2f} dB")
+            # Per-epoch amplitude sanity check on a fixed validation sample
+            try:
+                sample_idx = 0
+                lr_sample, hr_sample = val_loader.dataset[sample_idx]
+                lr_b = lr_sample.unsqueeze(0).to(device)
+                hr_b = hr_sample.unsqueeze(0).to(device)
+                with torch.no_grad():
+                    pred_b = model(lr_b)
+                # VV
+                lr_vv = torch.hypot(lr_b[:,0], lr_b[:,1])
+                hr_vv = torch.hypot(hr_b[:,0], hr_b[:,1])
+                pr_vv = torch.hypot(pred_b[:,0], pred_b[:,1])
+                # VH
+                lr_vh = torch.hypot(lr_b[:,2], lr_b[:,3])
+                hr_vh = torch.hypot(hr_b[:,2], hr_b[:,3])
+                pr_vh = torch.hypot(pred_b[:,2], pred_b[:,3])
+                print(f"  VV amp min/max  - LR: {lr_vv.min().item():.4f}/{lr_vv.max().item():.4f}, HR: {hr_vv.min().item():.4f}/{hr_vv.max().item():.4f}, Pred: {pr_vv.min().item():.4f}/{pr_vv.max().item():.4f}")
+                print(f"  VH amp min/max  - LR: {lr_vh.min().item():.4f}/{lr_vh.max().item():.4f}, HR: {hr_vh.min().item():.4f}/{hr_vh.max().item():.4f}, Pred: {pr_vh.min().item():.4f}/{pr_vh.max().item():.4f}")
+            except Exception:
+                pass
             
             # Save best model
             if val_loss < best_val_loss:
@@ -913,8 +954,8 @@ def test_model(model_path: str, data_dir: str, max_samples: int = None):
     model.to(device)
     model.eval()
     
-    # FIX: Add perceptual loss instance for validate_epoch
-    perceptual = PerceptualLoss().to(device)
+    # Perceptual disabled by default for test; enable only with weight > 0 via CLI
+    perceptual = None
     
     # --- Load test split from cache ---
     # Use appropriate cache file based on max_samples
@@ -955,8 +996,11 @@ if __name__ == "__main__":
     parser.add_argument('--no-cache', action='store_true', help="Disable LR patch caching")
     parser.add_argument('--num-workers', type=int, default=0, help="DataLoader num_workers (default 0)")
     parser.add_argument('--model-type', default='swin', choices=['swin','base'], help='Model backbone selection (WARNING: base model has channel mismatch issues)')
+    # Rebuild LR cache is handled externally by user; keeping CLI clean
     parser.add_argument('--dry-run', action='store_true', help='Run single forward pass and exit')
-    parser.add_argument('--no-perceptual', action='store_true', help='Disable perceptual VGG loss')
+    parser.add_argument('--no-perceptual', action='store_true', help='Disable perceptual VGG loss (deprecated; use --perceptual-weight=0.0)')
+    parser.add_argument('--perceptual-weight', type=float, default=0.0, help='Weight for perceptual loss (default 0.0 disables VGG)')
+    parser.add_argument('--fft-weight', type=float, default=0.02, help='Weight for high-frequency weighted FFT loss (0.0 to disable)')
     parser.add_argument('--auto-workers', action='store_true', help='Use optimal DataLoader workers automatically')
     parser.add_argument('--max-samples', type=int, default=None, help='Maximum number of samples to use (None for all data)')
     parser.add_argument('--resume', type=str, default=None, help='Resume training from checkpoint file')
@@ -997,6 +1041,8 @@ if __name__ == "__main__":
         'num_workers': get_optimal_workers() if args.auto_workers else args.num_workers,
         'tensorboard_log_dir': None,  # Will use timestamped directory
         'enable_perceptual': not args.no_perceptual,
+        'perceptual_weight': args.perceptual_weight,
+        'fft_weight': args.fft_weight,
         'max_samples': args.max_samples,
         'resume_checkpoint_path': args.resume,
     }

@@ -27,8 +27,8 @@ from typing import Tuple, List
 class ComplexConv2d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, k, s, p):
         super().__init__()
-        self.real = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False)
-        self.imag = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False)
+        self.real = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False, padding_mode='reflect')
+        self.imag = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False, padding_mode='reflect')
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         r = self.real(x.real) - self.imag(x.imag)
@@ -95,65 +95,23 @@ class ComplexBlurPool(nn.Module):
         return torch.complex(real, imag)
 
 # ================================================================
-# Complex PixelShuffle for upsampling
+# Complex Resize-based upsampling (anti-checkerboard)
 # ================================================================
 
-class ComplexPixelShuffle(nn.Module):
-    """Complex-valued pixel shuffle for anisotropic upsampling."""
+class ComplexResizeUpsample(nn.Module):
     def __init__(self, in_c: int, out_c: int, scale):
         super().__init__()
-        # Handle both int and tuple scale factors
         if isinstance(scale, int):
-            self.scale_h = self.scale_w = scale
+            self.scale = (scale, scale)
         else:
-            self.scale_h, self.scale_w = scale
-        
-        total_scale = self.scale_h * self.scale_w
-        self.conv = ComplexConv2d(in_c, out_c * total_scale, 3, 1, 1)
-        # ICNR initialization to reduce checkerboard artifacts
-        self._apply_icnr(total_scale)
+            self.scale = scale
+        self.conv = ComplexConv2d(in_c, out_c, 3, 1, 1)
 
-    def _icnr_(self, weight: torch.Tensor, scale_mul: int):
-        """In-place ICNR initialization for a real-valued conv weight.
-        weight shape: [out_c * scale_mul, in_c, kH, kW]
-        """
-        out_c, in_c, kH, kW = weight.shape
-        if out_c % scale_mul != 0:
-            # Fallback: kaiming normal if shape not divisible
-            nn.init.kaiming_normal_(weight)
-            return
-        new_shape = (out_c // scale_mul, in_c, kH, kW)
-        subkernel = torch.zeros(new_shape, device=weight.device, dtype=weight.dtype)
-        nn.init.kaiming_normal_(subkernel)
-        subkernel = subkernel.repeat_interleave(scale_mul, dim=0)
-        with torch.no_grad():
-            weight.copy_(subkernel)
-
-    def _apply_icnr(self, scale_mul: int):
-        # Apply ICNR on both real and imaginary conv weights
-        self._icnr_(self.conv.real.weight, scale_mul)
-        self._icnr_(self.conv.imag.weight, scale_mul)
-        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Apply complex convolution
-        x = self.conv(x)
-        B, C, H, W = x.shape
-        
-        # Reshape for anisotropic pixel shuffle
-        # x has shape [B, out_c * scale_h * scale_w, H, W]
-        out_c = C // (self.scale_h * self.scale_w)
-        
-        # Real part
-        real = x.real.view(B, out_c, self.scale_h, self.scale_w, H, W)
-        real = real.permute(0, 1, 4, 2, 5, 3).contiguous()
-        real = real.view(B, out_c, H * self.scale_h, W * self.scale_w)
-        
-        # Imaginary part  
-        imag = x.imag.view(B, out_c, self.scale_h, self.scale_w, H, W)
-        imag = imag.permute(0, 1, 4, 2, 5, 3).contiguous()
-        imag = imag.view(B, out_c, H * self.scale_h, W * self.scale_w)
-        
-        return torch.complex(real, imag)
+        real = F.interpolate(x.real, scale_factor=self.scale, mode='bilinear', align_corners=False, antialias=True)
+        imag = F.interpolate(x.imag, scale_factor=self.scale, mode='bilinear', align_corners=False, antialias=True)
+        x_up = torch.complex(real, imag)
+        return self.conv(x_up)
 
 # ================================================================
 # Attention blocks
@@ -210,7 +168,7 @@ class EncBlock(nn.Module):
 class DecBlock(nn.Module):
     def __init__(self, in_c, out_c, scale=2, skip_ch=None):
         super().__init__()
-        self.up   = ComplexPixelShuffle(in_c, out_c, scale)
+        self.up   = ComplexResizeUpsample(in_c, out_c, scale)
         # Calculate input channels for first conv: upsampled + skip features
         if skip_ch is None or skip_ch == 0:
             conv_in_ch = out_c  # No skip connection

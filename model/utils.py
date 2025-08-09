@@ -71,7 +71,7 @@ def _tv_l1(x: torch.Tensor) -> torch.Tensor:
     return dx + dy
 
 
-def sr_loss(recon, gt, perceptual=None):
+def sr_loss(recon, gt, perceptual=None, *, perceptual_weight: float = 0.0, fft_weight: float = 0.0):
     """
     Phase-preserving SR loss set for dual-pol SAR (VV, VH):
     - Log-amplitude Charbonnier (multiplicative speckle friendly)
@@ -92,9 +92,7 @@ def sr_loss(recon, gt, perceptual=None):
     w_log_amp = 0.45
     w_phase = 0.40
     w_cplx_l1 = 0.10
-    w_fft = 0.03
     w_tv = 1e-3
-    w_perc = 0.02  # amplitude-only perceptual
 
     # Convert to complex
     recon_vv = torch.complex(recon[:, 0], recon[:, 1])
@@ -134,23 +132,29 @@ def sr_loss(recon, gt, perceptual=None):
     cplx_l1_vh = F.l1_loss(recon_vh.real, gt_vh.real) + F.l1_loss(recon_vh.imag, gt_vh.imag)
     cplx_l1 = w_cplx_l1 * (cplx_l1_vv + cplx_l1_vh)
 
-    # 4) FFT (amplitude) spectrum L1
-    def amp_fft_l1(a_pred: torch.Tensor, a_gt: torch.Tensor) -> torch.Tensor:
+    # 4) FFT (amplitude) spectrum L1 with radial high-frequency weighting
+    def amp_fft_l1_weighted(a_pred: torch.Tensor, a_gt: torch.Tensor) -> torch.Tensor:
         Fp = torch.fft.rfft2(a_pred.float())
         Fg = torch.fft.rfft2(a_gt.float())
-        return torch.mean(torch.abs(torch.abs(Fp) - torch.abs(Fg)))
-    fft_loss = w_fft * (amp_fft_l1(amp_r_vv, amp_g_vv) + amp_fft_l1(amp_r_vh, amp_g_vh))
+        diff = torch.abs(torch.abs(Fp) - torch.abs(Fg))  # (B, H, W//2+1)
+        H, W_r = diff.shape[-2], diff.shape[-1]
+        fy = torch.fft.fftfreq(H, d=1.0, device=diff.device).abs().view(1, H, 1)
+        fx = torch.fft.rfftfreq((W_r - 1) * 2, d=1.0, device=diff.device).view(1, 1, W_r)
+        r = torch.sqrt(fy * fy + fx * fx)
+        r = r / (r.max() + 1e-8)
+        return (diff * r).mean()
+    fft_loss = fft_weight * (amp_fft_l1_weighted(amp_r_vv, amp_g_vv) + amp_fft_l1_weighted(amp_r_vh, amp_g_vh))
 
     # 5) Tiny TV on amplitude
     amp_stack = torch.stack([amp_r_vv, amp_r_vh], dim=1)  # (B,2,H,W)
     tv_loss = w_tv * _tv_l1(amp_stack)
 
-    # 6) Perceptual (amplitude-only) - small weight
+    # 6) Perceptual (amplitude-only) - weighted by flag
     p_loss = torch.tensor(0.0, device=recon.device)
-    if perceptual is not None:
+    if perceptual is not None and perceptual_weight > 0.0:
         p_vv = perceptual(recon[:, :2], gt[:, :2])
         p_vh = perceptual(recon[:, 2:], gt[:, 2:])
-        p_loss = w_perc * (p_vv + p_vh)
+        p_loss = perceptual_weight * (p_vv + p_vh)
 
     total_loss = log_amp_loss + phase_loss + cplx_l1 + fft_loss + tv_loss + p_loss
 
