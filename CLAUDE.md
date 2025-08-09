@@ -43,14 +43,17 @@ python model/visualize_tensorboard.py --analyze
 
 ### Data Processing
 ```bash
-# Extract patches from SAR data
+# Extract patches from SAR data (interactive notebook method - recommended)
+# Use workflows/patch_extract_v2.ipynb for quality-controlled extraction
+
+# Alternative: GPU-accelerated extractor (legacy)
 python workflows/patch_extractor_gpu_enhanced.py
 
-# Apply super-resolution to patches (single file)
-python workflows/SR_apply.py --input patch.npy --output sr_patch.npy --model model/acswin_unet_pp.pth
+# Apply super-resolution to patches (single file) - using latest model
+python workflows/SR_apply.py --input patch.npy --output sr_patch.npy --model model_weights/version5/acswin_unet_pp.pth
 
-# Apply super-resolution to directory
-python workflows/SR_apply.py --input-dir data/patches/LR --output-dir results/SR --model model/acswin_unet_pp.pth
+# Apply super-resolution to directory - using latest model
+python workflows/SR_apply.py --input-dir data/patches/LR --output-dir results/SR --model model_weights/version5/acswin_unet_pp.pth
 
 # Generate LR patches from HR patches
 python workflows/degrade_patches.py --hr-root data/patches/zero_filtered --lr-output data/patches/LR --num-patches 100
@@ -98,13 +101,17 @@ python model/train.py --dry-run
   - Automatic batch size adjustment and worker optimization
 
 ### Data Processing Pipeline
-1. **SNAP Preprocessing** (`data/graph*.xml`): Orbit correction, calibration, TOPSAR splitting
-2. **Patch Extraction** (`workflows/patch_extractor_gpu_enhanced.py`): 
-   - Dual-pol complex patch extraction with quality control
-   - Cross-pol coherence validation
-   - GPU acceleration with CuPy support
-   - Resume capability with 80% completion threshold
-3. **Data Loading** (`model/data_cache.py`): Efficient caching and LR degradation
+1. **SNAP Preprocessing** (`data/final.xml`): Complete processing graph including:
+   - Apply Orbit File (Sentinel Precise Auto Download)
+   - Radiometric Calibration (complex output, VV+VH polarizations) 
+   - TOPSAR Split (IW1, IW2, IW3 subswaths)
+   - TOPSAR Deburst and Merge (seamless subswath combination)
+2. **Patch Extraction** (`workflows/patch_extract_v2.ipynb`): Interactive notebook for:
+   - Quality-controlled patch extraction from SNAP-processed data
+   - Dual-pol complex patch generation with cross-pol coherence validation
+   - Zero-value filtering and statistical analysis
+   - Output to `data/patches/zero_filtered/` directory
+3. **Data Loading** (`model/data_cache.py`): Efficient caching and LR degradation from filtered patches
 
 ### Key Data Formats
 - **Input Patches**: (2, H, W) complex64 arrays representing [VV, VH] polarizations
@@ -118,6 +125,7 @@ python model/train.py --dry-run
 - **Current Default**: AC-Swin-UNet++ (`--model-type swin`) - recommended for production
 - **Model Creation**: Always use `create_model()` factory function from `ac_swin_unet_pp.py`
 - **Legacy Model**: Complex U-Net has channel mismatch issues and is not supported in current training
+- **Active Model Path**: `model_weights/version5/acswin_unet_pp.pth` (latest with artifact mitigation)
 
 ### SAR-Specific Considerations
 - **Complex Data Handling**: All models preserve both amplitude and phase information
@@ -141,15 +149,25 @@ python model/train.py --dry-run
 
 ### Training Configuration
 Training parameters are configured via command-line arguments in `model/train.py`. Key settings:
-- Default data directory: `D:\Sentinel-1\data\patches\zero_filtered`
-- Model save path: `D:\Sentinel-1\model\acswin_unet_pp.pth`  
+- **Data directory**: `D:\Sentinel-1\data\patches\zero_filtered` (quality-filtered patches from SNAP+notebook workflow)
+- Model save path: `D:\Sentinel-1\model_weights/version5/acswin_unet_pp.pth` (latest)
+- Backup save path: `D:\Sentinel-1\model\acswin_unet_pp.pth` (legacy compatibility)
 - Batch size: 32 (auto-adjustable)
 - Learning rate: 1e-4 with cosine annealing
 - Early stopping: 10 epochs patience
+- **Artifact Monitoring**: Enhanced logging for checkerboard pattern detection
 
 ### Data Processing Configuration
-Patch extraction parameters in `workflows/patch_extractor_gpu_enhanced.py`:
-- Patch dimensions: 256x512 (width x height)
+**Primary Method** - SNAP + Notebook workflow:
+1. `data/final.xml`: Complete SNAP processing graph (orbit, calibration, TOPSAR processing)
+2. `workflows/patch_extract_v2.ipynb`: Interactive patch extraction with quality control
+   - Output directory: `data/patches/zero_filtered/`
+   - Patch dimensions: 256x512 (width x height)
+   - Quality filtering: Zero-value removal and cross-pol coherence validation
+   - Statistical analysis and visualization included
+
+**Alternative Method** - Direct extraction:
+- `workflows/patch_extractor_gpu_enhanced.py`: GPU-accelerated processing
 - Stride: non-overlapping (256x512)
 - Quality threshold: cross-pol coherence > 0.01
 
@@ -199,7 +217,28 @@ Patch extraction parameters in `workflows/patch_extractor_gpu_enhanced.py`:
 - **npy2png.py**: Enhanced to correctly identify and process complex SAR data vs real data
 - **Model Loading**: Always use model factory functions, never instantiate model classes directly
 
+### Checkerboard Artifact Mitigation (Current Priority)
+- **Issue**: Models version 4-5 exhibit checkerboard artifacts in super-resolution outputs
+- **Causes**: Potential issues with PixelShuffle upsampling, loss function weighting, or training dynamics
+- **Current Approaches**:
+  - Modified Complex PixelShuffle implementation with improved weight initialization
+  - Adjusted hybrid loss function weighting (amplitude MSE vs phase L1)
+  - Enhanced data augmentation strategies
+  - Regularization techniques to prevent high-frequency artifacts
+- **Model Versions**: 
+  - Version 4: Initial checkerboard artifact identification
+  - Version 5: Latest mitigation attempts (ongoing)
+- **Monitoring**: TensorBoard visualization enhanced to detect and analyze artifact patterns
+
+### Recent Updates and Fixes
+- **Commit 1258390**: Latest checkerboard artifact mitigation strategies implemented
+- **Commit 8f6964f**: Enhanced TensorBoard visualization for artifact analysis
+- **Commit 8d6699c**: Modified loss functions and visualization improvements
+- **Training Status**: Ongoing experiments with different architectural modifications
+
 ### Common Issues and Solutions
 - **Shape Mismatch**: Clear LR cache if changing HR/LR dimensions: `rm -rf data/patches/*/lr_cache/`
 - **Model Import**: Use `from ac_swin_unet_pp import create_model` not direct class import
 - **Complex Data**: Ensure input data is complex64, not float32 - workflows now auto-detect and convert
+- **Checkerboard Artifacts**: Use latest model weights from version5 directory, monitor TensorBoard for artifact patterns
+- **Training Convergence**: If artifacts appear during training, consider reducing learning rate or adjusting loss weights
