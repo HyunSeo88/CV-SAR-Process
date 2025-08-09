@@ -35,21 +35,46 @@ def launch_tensorboard(log_dir: str, port: int = 6006, auto_open: bool = True):
     print(f"Launching TensorBoard on port {port}...")
     print(f"Log directory: {log_dir}")
     
-    # Launch TensorBoard
-    cmd = f"tensorboard --logdir={log_dir} --port={port}"
+    # Convert to absolute path to avoid path issues
+    abs_log_dir = Path(log_dir).resolve()
+    print(f"Absolute log directory: {abs_log_dir}")
+    
+    # Launch TensorBoard with additional options for better compatibility
+    cmd = [
+        "tensorboard",
+        f"--logdir={abs_log_dir}",
+        f"--port={port}",
+        "--reload_interval=1",
+        "--samples_per_plugin=images=100"
+    ]
     
     try:
         # Start TensorBoard process
-        process = subprocess.Popen(cmd, shell=True)
+        print(f"Running command: {' '.join(cmd)}")
+        process = subprocess.Popen(cmd, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Wait a moment for TensorBoard to start
+        import time
+        time.sleep(2)
+        
+        # Check if process started successfully
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            print(f"TensorBoard failed to start!")
+            print(f"stdout: {stdout.decode()}")
+            print(f"stderr: {stderr.decode()}")
+            return
+        
+        print(f"TensorBoard server started (PID: {process.pid})")
+        print(f"Access at: http://localhost:{port}")
         
         # Open browser if requested
         if auto_open:
             url = f"http://localhost:{port}"
             print(f"Opening browser: {url}")
+            time.sleep(1)  # Give TensorBoard more time to start
             webbrowser.open(url)
         
-        print(f"TensorBoard server started (PID: {process.pid})")
-        print(f"Access at: http://localhost:{port}")
         print("Press Ctrl+C to stop the server")
         
         # Wait for user interrupt

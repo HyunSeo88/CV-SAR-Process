@@ -46,11 +46,20 @@ python model/visualize_tensorboard.py --analyze
 # Extract patches from SAR data
 python workflows/patch_extractor_gpu_enhanced.py
 
-# Apply super-resolution to patches
-python workflows/SR_apply.py
+# Apply super-resolution to patches (single file)
+python workflows/SR_apply.py --input patch.npy --output sr_patch.npy --model model/acswin_unet_pp.pth
 
-# Convert numpy arrays to PNG for visualization
-python workflows/npy2png.py
+# Apply super-resolution to directory
+python workflows/SR_apply.py --input-dir data/patches/LR --output-dir results/SR --model model/acswin_unet_pp.pth
+
+# Generate LR patches from HR patches
+python workflows/degrade_patches.py --hr-root data/patches/zero_filtered --lr-output data/patches/LR --num-patches 100
+
+# Convert numpy arrays to PNG for visualization (VV polarization)
+python workflows/npy2png.py --input patch.npy --output patch_vv.png --polarization VV
+
+# Convert numpy arrays to PNG for visualization (VH polarization)
+python workflows/npy2png.py --input patch.npy --output patch_vh.png --polarization VH
 ```
 
 ### Model Testing
@@ -101,11 +110,13 @@ python model/train.py --dry-run
 - **Input Patches**: (2, H, W) complex64 arrays representing [VV, VH] polarizations
 - **Model I/O**: 4-channel real tensors [VV-Re, VV-Im, VH-Re, VH-Im] for PyTorch compatibility
 - **Training Data**: HR patches (512x256) with synthetic LR patches (128x64) via degradation
+- **SR Pipeline**: complex64 (2,128,64) → model → complex64 (2,512,256) for 4x super-resolution
 
 ## Important Implementation Details
 
 ### Model Selection
 - **Current Default**: AC-Swin-UNet++ (`--model-type swin`) - recommended for production
+- **Model Creation**: Always use `create_model()` factory function from `ac_swin_unet_pp.py`
 - **Legacy Model**: Complex U-Net has channel mismatch issues and is not supported in current training
 
 ### SAR-Specific Considerations
@@ -161,6 +172,8 @@ Patch extraction parameters in `workflows/patch_extractor_gpu_enhanced.py`:
 - SAR patches should be complex64 format with shape (2, H, W)
 - Quality control through cross-pol coherence calculation
 - Maintain consistent file naming: `*_dual_pol_complex_{x}_{y}.npy`
+- **LR Degradation**: Uses block-wise amplitude averaging + phase averaging for realistic degradation
+- **Data Caching**: LR patches cached automatically in `lr_cache/` subdirectories
 
 ## Performance Targets
 
@@ -173,3 +186,20 @@ Patch extraction parameters in `workflows/patch_extractor_gpu_enhanced.py`:
 - **Memory Usage**: ~8-12GB GPU memory for batch size 32
 - **Training Speed**: ~0.66 patches/second processing rate
 - **Convergence**: Typically converges within 50-100 epochs
+
+## Critical Implementation Notes
+
+### Data Handling
+- **Complex Data**: All SAR data must be complex64 format - workflows now validate and convert automatically
+- **TensorBoard Fix**: LR visualization now uses bilinear upsampling instead of nearest neighbor for smoother display
+- **Shape Validation**: Training pipeline validates HR patches are (512,256) and LR patches are (128,64)
+
+### Workflow Compatibility
+- **SR_apply.py**: Fixed to properly handle complex64 input and use `create_model()` function
+- **npy2png.py**: Enhanced to correctly identify and process complex SAR data vs real data
+- **Model Loading**: Always use model factory functions, never instantiate model classes directly
+
+### Common Issues and Solutions
+- **Shape Mismatch**: Clear LR cache if changing HR/LR dimensions: `rm -rf data/patches/*/lr_cache/`
+- **Model Import**: Use `from ac_swin_unet_pp import create_model` not direct class import
+- **Complex Data**: Ensure input data is complex64, not float32 - workflows now auto-detect and convert

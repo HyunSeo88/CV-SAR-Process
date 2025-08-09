@@ -171,33 +171,6 @@ class SARSuperResDataset(Dataset):
         ], axis=0)).float()
         return lr_tensor, hr_tensor
 
-    def fetch_raw_patch(self, idx):
-        """
-        Load a raw complex SAR patch, resized to the standard HR size.
-        This ensures consistency for visualization tasks like TensorBoard logging.
-
-        Args:
-            idx: Dataset index
-        Returns:
-            np.ndarray with shape (2, H, W) complex64 representing the processed patch.
-        """
-        if hasattr(self, 'synthetic_data'):
-            hr_data = self.synthetic_data[idx]
-        else:
-            hr_file = self.hr_files[idx]
-            hr_data = np.load(hr_file)
-
-        # HR size is now consistent - no cropping/padding needed
-        # Ensure correct shape and data type through transpose only
-        if hr_data.shape != (2, *self.hr_size):
-            if hr_data.shape == (2, self.hr_size[1], self.hr_size[0]):
-                hr_data = np.transpose(hr_data, (0, 2, 1))
-
-        # Ensure dtype consistency
-        if hr_data.dtype != np.complex64:
-            hr_data = hr_data.astype(np.complex64)
-            
-        return hr_data
 
 
 class EarlyStopping:
@@ -462,15 +435,21 @@ def validate_epoch(model, val_loader, device, metrics_calc, perceptual):
     return total_loss / max(total_samples, 1)
 
 
-def log_images_to_tensorboard(writer, raw_batch, lr_batch, hr_batch, pred_batch, epoch, num_images=4, fixed_range=(0.001, 10.0)):
+def log_images_to_tensorboard(writer, lr_batch, hr_batch, pred_batch, epoch, num_images=1, fixed_range=(0.001, 10.0)):
     """
     Logs SAR image visualizations to TensorBoard with consistent normalization.
-    - Uses fixed dB range for consistent brightness across all epochs.
+    - Uses adaptive normalization for clear visualization.
     - Calculates VV and VH amplitude correctly.
     - Upscales LR image for consistent visualization size.
+    - All images (Raw, LR, HR, SR) come from the same source patch for meaningful comparison.
     
     Args:
-        fixed_range: Tuple of (min_db, max_db) for consistent normalization across epochs
+        lr_batch: LR 4-channel real data (batch_size, 4, h, w)
+        hr_batch: HR 4-channel real data (batch_size, 4, H, W) 
+        pred_batch: SR 4-channel real data (batch_size, 4, H, W)
+        epoch: Current training epoch
+        num_images: Number of images to display (typically 1 for clarity)
+        fixed_range: Tuple of (min_db, max_db) for reference (not used with adaptive normalization)
     """
     num_images = min(num_images, lr_batch.shape[0])
     hr_size = (hr_batch.shape[2], hr_batch.shape[3]) # e.g., (512, 256)
@@ -478,9 +457,9 @@ def log_images_to_tensorboard(writer, raw_batch, lr_batch, hr_batch, pred_batch,
     # --- 1. Correctly calculate amplitude for each polarization (VV and VH) ---
     # Note: torch.hypot(real, imag) is a robust way to compute sqrt(real**2 + imag**2)
     
-    # Raw HR (complex)
-    raw_amp_vv = torch.abs(raw_batch[:num_images, 0]) # VV
-    raw_amp_vh = torch.abs(raw_batch[:num_images, 1]) # VH
+    # Raw HR (reconstruct complex from HR target for consistency)
+    raw_amp_vv = torch.hypot(hr_batch[:num_images, 0], hr_batch[:num_images, 1])  # Same as HR target
+    raw_amp_vh = torch.hypot(hr_batch[:num_images, 2], hr_batch[:num_images, 3])  # Same as HR target
     
     # LR (4-channel real)
     lr_amp_vv = torch.hypot(lr_batch[:num_images, 0], lr_batch[:num_images, 1])
@@ -494,10 +473,8 @@ def log_images_to_tensorboard(writer, raw_batch, lr_batch, hr_batch, pred_batch,
     pred_amp_vv = torch.hypot(pred_batch[:num_images, 0], pred_batch[:num_images, 1])
     pred_amp_vh = torch.hypot(pred_batch[:num_images, 2], pred_batch[:num_images, 3])
 
-    # --- 2. Upscale LR and Raw images for visualization purposes ---
+    # --- 2. Upscale LR images for visualization purposes ---
     # This does not affect training, only what's shown on TensorBoard.
-    raw_amp_vv_up = F.interpolate(raw_amp_vv.unsqueeze(1), size=hr_size, mode='bilinear', align_corners=False).squeeze(1)
-    raw_amp_vh_up = F.interpolate(raw_amp_vh.unsqueeze(1), size=hr_size, mode='bilinear', align_corners=False).squeeze(1)
     lr_amp_vv_up = F.interpolate(lr_amp_vv.unsqueeze(1), size=hr_size, mode='bilinear', align_corners=False).squeeze(1)
     lr_amp_vh_up = F.interpolate(lr_amp_vh.unsqueeze(1), size=hr_size, mode='bilinear', align_corners=False).squeeze(1)
 
@@ -507,8 +484,12 @@ def log_images_to_tensorboard(writer, raw_batch, lr_batch, hr_batch, pred_batch,
         log_amp = 20 * torch.log10(amp_tensor + 1e-8)  # Convert to dB
         # Normalize to [0, 1] using fixed dB range
         norm_amp = (log_amp - min_db) / (max_db - min_db)
-        # Add channel dimension and convert to uint8
-        return (norm_amp.unsqueeze(1).clamp(0, 1) * 255).to(torch.uint8)
+        # Clamp to [0, 1] and keep as float32 for TensorBoard
+        norm_amp = norm_amp.clamp(0, 1)
+        # Check for NaN/Inf and replace with 0
+        norm_amp = torch.where(torch.isfinite(norm_amp), norm_amp, torch.tensor(0.0, device=norm_amp.device))
+        # Add channel dimension for grayscale images
+        return norm_amp.unsqueeze(1)
     
     def normalize_for_display_adaptive(amp_tensor):
         # Adaptive normalization for individual tensor
@@ -516,23 +497,46 @@ def log_images_to_tensorboard(writer, raw_batch, lr_batch, hr_batch, pred_batch,
         min_db = log_amp.min()
         max_db = log_amp.max()
         norm_amp = (log_amp - min_db) / (max_db - min_db + 1e-8)
-        return (norm_amp.unsqueeze(1).clamp(0, 1) * 255).to(torch.uint8)
+        norm_amp = norm_amp.clamp(0, 1)
+        # Check for NaN/Inf and replace with 0
+        norm_amp = torch.where(torch.isfinite(norm_amp), norm_amp, torch.tensor(0.0, device=norm_amp.device))
+        return norm_amp.unsqueeze(1)
 
     min_db, max_db = fixed_range
+    
+    # Debug: Print actual data ranges to understand normalization issues
+    print(f"Debug - Amplitude ranges:")
+    print(f"  LR VV: {lr_amp_vv.min():.6f} - {lr_amp_vv.max():.6f}")
+    print(f"  HR VV: {hr_amp_vv.min():.6f} - {hr_amp_vv.max():.6f}")
+    print(f"  Pred VV: {pred_amp_vv.min():.6f} - {pred_amp_vv.max():.6f}")
+    print(f"  Fixed dB range: {min_db} - {max_db}")
 
     # --- VV Polarization Visualization ---
     # Note: LR_Input_Upscaled shows degraded version of HR (4x4 block averaging + bilinear upscale)
-    # It should appear blurred compared to Raw_HR due to information loss in LR generation
-    writer.add_images('SAR_Images_VV/1_Raw_HR', normalize_for_display_fixed_range(raw_amp_vv_up, min_db, max_db), epoch)
-    writer.add_images('SAR_Images_VV/2_LR_Input_Upscaled', normalize_for_display_fixed_range(lr_amp_vv_up, min_db, max_db), epoch)
-    writer.add_images('SAR_Images_VV/3_HR_Target', normalize_for_display_fixed_range(hr_amp_vv, min_db, max_db), epoch)
-    writer.add_images('SAR_Images_VV/4_SR_Prediction', normalize_for_display_fixed_range(pred_amp_vv, min_db, max_db), epoch)
+    # It should appear blurred compared to HR_Target due to information loss in LR generation
+    try:
+        # Use adaptive normalization for clear visualization
+        vv_hr_norm = normalize_for_display_adaptive(hr_amp_vv)  # HR Target (ground truth)
+        vv_lr_norm = normalize_for_display_adaptive(lr_amp_vv_up)
+        vv_pred_norm = normalize_for_display_adaptive(pred_amp_vv)
+        
+        writer.add_images('SAR_Images_VV/1_HR_Target', vv_hr_norm, epoch)
+        writer.add_images('SAR_Images_VV/2_LR_Input_Upscaled', vv_lr_norm, epoch)
+        writer.add_images('SAR_Images_VV/3_SR_Prediction', vv_pred_norm, epoch)
+    except Exception as e:
+        print(f"Warning: Failed to log VV images to TensorBoard: {e}")
 
     # --- VH Polarization Visualization ---
-    writer.add_images('SAR_Images_VH/1_Raw_HR', normalize_for_display_fixed_range(raw_amp_vh_up, min_db, max_db), epoch)
-    writer.add_images('SAR_Images_VH/2_LR_Input_Upscaled', normalize_for_display_fixed_range(lr_amp_vh_up, min_db, max_db), epoch)
-    writer.add_images('SAR_Images_VH/3_HR_Target', normalize_for_display_fixed_range(hr_amp_vh, min_db, max_db), epoch)
-    writer.add_images('SAR_Images_VH/4_SR_Prediction', normalize_for_display_fixed_range(pred_amp_vh, min_db, max_db), epoch)
+    try:
+        vh_hr_norm = normalize_for_display_adaptive(hr_amp_vh)  # HR Target (ground truth)
+        vh_lr_norm = normalize_for_display_adaptive(lr_amp_vh_up)
+        vh_pred_norm = normalize_for_display_adaptive(pred_amp_vh)
+        
+        writer.add_images('SAR_Images_VH/1_HR_Target', vh_hr_norm, epoch)
+        writer.add_images('SAR_Images_VH/2_LR_Input_Upscaled', vh_lr_norm, epoch)
+        writer.add_images('SAR_Images_VH/3_SR_Prediction', vh_pred_norm, epoch)
+    except Exception as e:
+        print(f"Warning: Failed to log VH images to TensorBoard: {e}")
 def log_complex_statistics(writer, tensor, tag, epoch):
     if not torch.is_complex(tensor):
         if tensor.shape[1] < 2:
@@ -606,6 +610,7 @@ def train_model(
     gpu_degrade: bool = False,
     num_workers: int = 0,
     max_samples: int = None,
+    resume_checkpoint_path: str = None,
 ):
     """
     Main training function with TensorBoard logging
@@ -664,6 +669,40 @@ def train_model(
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = sched.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-7)
     
+    # Resume from checkpoint if provided
+    start_epoch = 0
+    history = {'train_loss': [], 'val_loss': [], 'train_psnr': [], 'val_psnr': []}
+    
+    if resume_checkpoint_path and os.path.exists(resume_checkpoint_path):
+        print(f"Resuming training from checkpoint: {resume_checkpoint_path}")
+        checkpoint = torch.load(resume_checkpoint_path, map_location=device, weights_only=False)
+        
+        # Load model and optimizer states
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Resume from saved epoch
+        start_epoch = checkpoint.get('epoch', 0)
+        history = checkpoint.get('history', history)
+        
+        # Restore hyperparameters if available
+        saved_hyperparams = checkpoint.get('hyperparameters', {})
+        if saved_hyperparams:
+            print("Restoring saved hyperparameters:")
+            for key, value in saved_hyperparams.items():
+                if key in locals():
+                    locals()[key] = value
+                    print(f"  {key}: {value}")
+        
+        # Restore TensorBoard log directory if available
+        saved_tb_dir = checkpoint.get('tensorboard_log_dir')
+        if saved_tb_dir and tensorboard_log_dir is None:
+            tensorboard_log_dir = saved_tb_dir
+            print(f"Continuing with TensorBoard directory: {tensorboard_log_dir}")
+        
+        print(f"Resumed from epoch {start_epoch}")
+        print(f"Previous validation loss: {checkpoint.get('val_loss', 'unknown')}")
+    
     # PERF: Setup AMP scaler
     scaler = GradScaler()
     
@@ -695,14 +734,6 @@ def train_model(
     train_metrics = MetricsCalculator()
     val_metrics = MetricsCalculator()
     
-    # Training history
-    history = {
-        'train_loss': [],
-        'val_loss': [],
-        'train_psnr': [],
-        'val_psnr': []
-    }
-    
     best_val_loss = float('inf')
     start_time = time.time()
     
@@ -711,7 +742,7 @@ def train_model(
     
     # PERF: Wrap training loop with profiler (or do nothing)
     with outer_ctx:
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             epoch_start = time.time()
             
             print(f"\nEpoch {epoch+1}/{num_epochs}")
@@ -761,21 +792,22 @@ def train_model(
                 # Log images
                 if epoch % 5 == 0 or epoch == num_epochs - 1: # Log every 5 epochs or at the end
                     # -------- TensorBoard sample preparation --------
-                    num_tb_imgs = 4  # number of images to log
-                    # Raw HR patches (untouched)
-                    raw_list = [torch.from_numpy(val_loader.dataset.fetch_raw_patch(i)) for i in range(num_tb_imgs)]
-                    raw_batch_sample = torch.stack(raw_list).to(device)
-
-                    # LR / HR pairs from validation loader
-                    lr_batch_sample, hr_batch_sample = next(iter(val_loader))  # Get a sample batch
-                    lr_batch_sample = lr_batch_sample.to(device)
-                    hr_batch_sample = hr_batch_sample.to(device)
+                    num_tb_imgs = 1  # Use only 1 image for cleaner display
                     
+                    # Get consistent sample from same patch
+                    sample_idx = 0  # Use first validation sample for consistency
+                    
+                    # Get LR/HR pair from validation dataset (same source)
+                    lr_sample, hr_sample = val_loader.dataset[sample_idx]
+                    lr_batch_sample = lr_sample.unsqueeze(0).to(device)  # Add batch dimension
+                    hr_batch_sample = hr_sample.unsqueeze(0).to(device)  # Add batch dimension
+                    
+                    # Generate prediction from the same LR data
                     with torch.no_grad():
                         pred_hr_sample = model(lr_batch_sample)
                     
-                    # Log side-by-side Raw → HR → SR
-                    log_images_to_tensorboard(writer, raw_batch_sample, lr_batch_sample, hr_batch_sample, pred_hr_sample, epoch)
+                    # Log side-by-side LR → HR → SR (all from same source)
+                    log_images_to_tensorboard(writer, lr_batch_sample, hr_batch_sample, pred_hr_sample, epoch, num_images=1)
                     log_complex_statistics(writer, hr_batch_sample, 'HR_Target', epoch)
                     log_complex_statistics(writer, pred_hr_sample, 'SR_Prediction', epoch)
                     
@@ -815,7 +847,20 @@ def train_model(
                     'val_loss': val_loss,
                     'train_loss': train_loss,
                     'history': history,
-                    'model_params': model.count_parameters()
+                    'model_params': model.count_parameters(),
+                    'hyperparameters': {
+                        'num_epochs': num_epochs,
+                        'batch_size': batch_size,
+                        'learning_rate': learning_rate,
+                        'early_stop_patience': early_stop_patience,
+                        'early_stop_threshold': early_stop_threshold,
+                        'enable_perceptual': enable_perceptual,
+                        'max_samples': max_samples,
+                        'use_cache': use_cache,
+                        'gpu_degrade': gpu_degrade,
+                        'num_workers': num_workers
+                    },
+                    'tensorboard_log_dir': tensorboard_log_dir
                 }
                 torch.save(checkpoint, model_save_path)
             
@@ -914,6 +959,7 @@ if __name__ == "__main__":
     parser.add_argument('--no-perceptual', action='store_true', help='Disable perceptual VGG loss')
     parser.add_argument('--auto-workers', action='store_true', help='Use optimal DataLoader workers automatically')
     parser.add_argument('--max-samples', type=int, default=None, help='Maximum number of samples to use (None for all data)')
+    parser.add_argument('--resume', type=str, default=None, help='Resume training from checkpoint file')
     args = parser.parse_args()
 
     # Set multiprocessing start method to avoid CUDA init deadlocks
@@ -952,6 +998,7 @@ if __name__ == "__main__":
         'tensorboard_log_dir': None,  # Will use timestamped directory
         'enable_perceptual': not args.no_perceptual,
         'max_samples': args.max_samples,
+        'resume_checkpoint_path': args.resume,
     }
     
     # PERF: Auto-adjust batch size if flag set
