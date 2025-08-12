@@ -19,6 +19,13 @@ import math
 import torchvision.models as models
 from typing import Optional
 
+"""
+Fixed PSNR reference values for VV and VH amplitude when --psnr-ref=fixed.
+Tune if a different fixed scaling is desired; defaults keep backward behavior.
+"""
+PSNR_REF_VV: float = 1.0
+PSNR_REF_VH: float = 1.0
+
 def _ensure_complex(t: torch.Tensor) -> torch.Tensor:
     """Convert 4-channel real tensor → 2-channel complex tensor if needed."""
     if torch.is_complex(t):
@@ -71,7 +78,20 @@ def _tv_l1(x: torch.Tensor) -> torch.Tensor:
     return dx + dy
 
 
-def sr_loss(recon, gt, perceptual=None, *, perceptual_weight: float = 0.0, fft_weight: float = 0.0):
+def sr_loss(
+    recon,
+    gt,
+    perceptual=None,
+    *,
+    perceptual_weight: float = 0.0,
+    fft_weight: float = 0.0,
+    phase_coh_weight_on: bool = True,
+    phase_coh_p: float = 1.0,
+    phase_window: int = 7,
+    peak_boost_on: bool = True,
+    peak_topk: float = 95.0,
+    peak_weight: float = 0.05,
+):
     """
     Phase-preserving SR loss set for dual-pol SAR (VV, VH):
     - Log-amplitude Charbonnier (multiplicative speckle friendly)
@@ -89,10 +109,11 @@ def sr_loss(recon, gt, perceptual=None, *, perceptual_weight: float = 0.0, fft_w
         Dict of loss components
     """
     # Weights (phase preservation first)
-    w_log_amp = 0.45
-    w_phase = 0.40
-    w_cplx_l1 = 0.10
-    w_tv = 1e-3
+    w_log_amp = 0.30
+    w_phase = 0.25
+    w_cplx_l1 = 0.25
+    w_tv = 8e-3
+    # respect caller-provided fft_weight; do not override
 
     # Convert to complex
     recon_vv = torch.complex(recon[:, 0], recon[:, 1])
@@ -132,18 +153,51 @@ def sr_loss(recon, gt, perceptual=None, *, perceptual_weight: float = 0.0, fft_w
     cplx_l1_vh = F.l1_loss(recon_vh.real, gt_vh.real) + F.l1_loss(recon_vh.imag, gt_vh.imag)
     cplx_l1 = w_cplx_l1 * (cplx_l1_vv + cplx_l1_vh)
 
-    # 4) FFT (amplitude) spectrum L1 with radial high-frequency weighting
-    def amp_fft_l1_weighted(a_pred: torch.Tensor, a_gt: torch.Tensor) -> torch.Tensor:
-        Fp = torch.fft.rfft2(a_pred.float())
-        Fg = torch.fft.rfft2(a_gt.float())
-        diff = torch.abs(torch.abs(Fp) - torch.abs(Fg))  # (B, H, W//2+1)
-        H, W_r = diff.shape[-2], diff.shape[-1]
+    # 4) Complex FFT spectrum L1 with radial high-frequency weighting (preserves phase)
+    def complex_fft_l1_weighted(c_pred: torch.Tensor, c_gt: torch.Tensor) -> torch.Tensor:
+        # Full complex FFT (not just real FFT) to preserve phase information
+        Fp = torch.fft.fft2(c_pred)  # Full complex FFT
+        Fg = torch.fft.fft2(c_gt)    # Full complex FFT
+        
+        # Complex spectrum difference (preserves both amplitude and phase)
+        diff = torch.abs(Fp - Fg)  # L1 distance in complex domain
+        H, W = diff.shape[-2], diff.shape[-1]
+        
+        # Create radial frequency weighting (emphasize high frequencies)
         fy = torch.fft.fftfreq(H, d=1.0, device=diff.device).abs().view(1, H, 1)
-        fx = torch.fft.rfftfreq((W_r - 1) * 2, d=1.0, device=diff.device).view(1, 1, W_r)
+        fx = torch.fft.fftfreq(W, d=1.0, device=diff.device).abs().view(1, 1, W)
         r = torch.sqrt(fy * fy + fx * fx)
         r = r / (r.max() + 1e-8)
+        
         return (diff * r).mean()
-    fft_loss = fft_weight * (amp_fft_l1_weighted(amp_r_vv, amp_g_vv) + amp_fft_l1_weighted(amp_r_vh, amp_g_vh))
+    
+    # Apply complex FFT loss to both VV and VH polarizations
+    fft_loss = fft_weight * (complex_fft_l1_weighted(recon_vv, gt_vv) + complex_fft_l1_weighted(recon_vh, gt_vh))
+    
+    # Optional: Additional phase spectrum consistency loss for high frequencies
+    def phase_spectrum_loss(c_pred: torch.Tensor, c_gt: torch.Tensor) -> torch.Tensor:
+        Fp = torch.fft.fft2(c_pred)
+        Fg = torch.fft.fft2(c_gt)
+        
+        phase_pred = torch.angle(Fp)
+        phase_gt = torch.angle(Fg)
+        
+        # Circular phase difference (handles phase wrapping)
+        phase_diff = phase_pred - phase_gt
+        phase_diff = torch.atan2(torch.sin(phase_diff), torch.cos(phase_diff))
+        
+        # Emphasize high frequencies for phase consistency
+        H, W = phase_diff.shape[-2], phase_diff.shape[-1]
+        fy = torch.fft.fftfreq(H, d=1.0, device=phase_diff.device).abs().view(1, H, 1)
+        fx = torch.fft.fftfreq(W, d=1.0, device=phase_diff.device).abs().view(1, 1, W)
+        r = torch.sqrt(fy * fy + fx * fx)
+        r = r / (r.max() + 1e-8)
+        
+        return (torch.abs(phase_diff) * r).mean()
+    
+    # Add phase spectrum loss with smaller weight
+    phase_spectrum_weight = fft_weight * 0.3  # 30% of FFT loss weight
+    phase_fft_loss = phase_spectrum_weight * (phase_spectrum_loss(recon_vv, gt_vv) + phase_spectrum_loss(recon_vh, gt_vh))
 
     # 5) Tiny TV on amplitude
     amp_stack = torch.stack([amp_r_vv, amp_r_vh], dim=1)  # (B,2,H,W)
@@ -156,7 +210,62 @@ def sr_loss(recon, gt, perceptual=None, *, perceptual_weight: float = 0.0, fft_w
         p_vh = perceptual(recon[:, 2:], gt[:, 2:])
         p_loss = perceptual_weight * (p_vv + p_vh)
 
-    total_loss = log_amp_loss + phase_loss + cplx_l1 + fft_loss + tv_loss + p_loss
+    # 7) Coherence-weighted phase loss (optional)
+    coh_loss = torch.tensor(0.0, device=recon.device)
+    if phase_coh_weight_on:
+        win = max(1, int(phase_window))
+        pad = win // 2
+        # Helper for local avg pooling on real tensors
+        def avg_pool(x):
+            return F.avg_pool2d(x, kernel_size=win, stride=1, padding=pad)
+        # Complex local cross-coherence between recon and gt
+        def local_coherence(c_pred: torch.Tensor, c_gt: torch.Tensor) -> torch.Tensor:
+            rp, ip = c_pred.real, c_pred.imag
+            rg, ig = c_gt.real, c_gt.imag
+            # Cross term average within window
+            real_num = avg_pool(rp * rg + ip * ig)
+            imag_num = avg_pool(ip * rg - rp * ig)
+            num_mag = torch.sqrt(real_num ** 2 + imag_num ** 2 + 1e-16)  # Numerical stability
+            # Denominator: sqrt(E[|pred|^2] E[|gt|^2])
+            ep = avg_pool(rp * rp + ip * ip) + 1e-16  # Prevent zero power
+            eg = avg_pool(rg * rg + ig * ig) + 1e-16
+            denom = torch.sqrt(ep * eg)
+            gamma = (num_mag / (denom + 1e-12)).clamp(0.0, 1.0)
+            return gamma
+        gamma_vv = local_coherence(recon_vv, gt_vv)
+        gamma_vh = local_coherence(recon_vh, gt_vh)
+        # Weighting function w(t) = t^p
+        p = float(phase_coh_p)
+        w_vv = (gamma_vv ** p).detach()
+        w_vh = (gamma_vh ** p).detach()
+        coh_vv = (w_vv * (1 - torch.cos(dphi_vv))).mean()
+        coh_vh = (w_vh * (1 - torch.cos(dphi_vh))).mean()
+        coh_loss = coh_vv + coh_vh
+
+    # 8) Peak-boost amplitude loss (optional)
+    peak_loss = torch.tensor(0.0, device=recon.device)
+    if peak_boost_on and peak_weight > 0.0:
+        # Use GT amplitude to select top P% bright pixels per-sample
+        amp_g = torch.stack([amp_g_vv, amp_g_vh], dim=1)  # [B,2,H,W]
+        amp_r = torch.stack([amp_r_vv, amp_r_vh], dim=1)
+        B = amp_g.shape[0]
+        P = float(peak_topk) / 100.0
+        
+        # Vectorized quantile computation for better efficiency
+        amp_g_flat = amp_g.view(B, -1)  # [B, 2*H*W]
+        thresh = torch.quantile(amp_g_flat, P, dim=1, keepdim=True)  # [B, 1]
+        thresh = thresh.view(B, 1, 1, 1)
+        
+        # Apply mask with soft edge for better gradient flow
+        mask = (amp_g >= thresh).float()
+        amp_l1 = torch.abs(amp_r - amp_g)
+        peak_loss = peak_weight * (amp_l1 * mask).mean()
+
+    total_loss = log_amp_loss + phase_loss + cplx_l1 + fft_loss + phase_fft_loss + tv_loss + p_loss
+    if phase_coh_weight_on:
+        total_loss = total_loss + coh_loss
+    if peak_boost_on and peak_weight > 0.0:
+        total_loss = total_loss + peak_loss
 
     return {
         'total_loss': total_loss,
@@ -166,8 +275,11 @@ def sr_loss(recon, gt, perceptual=None, *, perceptual_weight: float = 0.0, fft_w
         'phase_loss_vh': w_phase * phase_loss_vh,
         'complex_l1': cplx_l1,
         'fft_loss': fft_loss,
+        'phase_fft_loss': phase_fft_loss,
         'tv_loss': tv_loss,
         'perceptual_loss': p_loss,
+        'phase_coh_loss': coh_loss if phase_coh_weight_on else torch.tensor(0.0, device=recon.device),
+        'peak_loss': peak_loss if peak_boost_on else torch.tensor(0.0, device=recon.device),
     }
 
 
@@ -206,34 +318,37 @@ def calculate_psnr(recon: torch.Tensor, gt: torch.Tensor, max_val: Optional[floa
     return psnr.item()
 
 
-def calculate_psnr_dual_pol(recon: torch.Tensor, gt: torch.Tensor) -> dict:
-    """Calculate PSNR for both VV and VH polarizations separately."""
+def calculate_psnr_dual_pol(recon: torch.Tensor, gt: torch.Tensor, ref: str = 'fixed') -> dict:
+    """Calculate PSNR for both VV and VH with reference selection.
+    ref: 'fixed' uses PSNR_REF constants; 'per_dataset' uses gt max amplitude
+    """
     # Convert 4-channel real to complex
     recon_vv = torch.complex(recon[:, 0], recon[:, 1])
     recon_vh = torch.complex(recon[:, 2], recon[:, 3])
     gt_vv = torch.complex(gt[:, 0], gt[:, 1])
     gt_vh = torch.complex(gt[:, 2], gt[:, 3])
-    
+
     recon_vv_amp = torch.abs(recon_vv)
     recon_vh_amp = torch.abs(recon_vh)
     gt_vv_amp = torch.abs(gt_vv)
     gt_vh_amp = torch.abs(gt_vh)
-    
-    # Use max value from ground truth for PSNR calculation
-    max_val_vv = gt_vv_amp.max()
-    max_val_vh = gt_vh_amp.max()
-    
-    # Calculate PSNR for each polarization
+
+    if ref == 'fixed':
+        # Use globally defined constants for consistent PSNR comparison
+        max_val_vv = torch.tensor(PSNR_REF_VV, device=recon.device)
+        max_val_vh = torch.tensor(PSNR_REF_VH, device=recon.device)
+    else:
+        max_val_vv = gt_vv_amp.max()
+        max_val_vh = gt_vh_amp.max()
+
     mse_vv = F.mse_loss(recon_vv_amp, gt_vv_amp)
     mse_vh = F.mse_loss(recon_vh_amp, gt_vh_amp)
-    
-    # 0으로 나누는 것을 방지하기 위해 작은 값(epsilon) 추가
+
     epsilon = 1e-9
-    
     psnr_vv = 20 * torch.log10(max_val_vv / torch.sqrt(mse_vv + epsilon))
     psnr_vh = 20 * torch.log10(max_val_vh / torch.sqrt(mse_vh + epsilon))
     psnr_avg = (psnr_vv + psnr_vh) / 2
-    
+
     return {
         'psnr_vv': psnr_vv.item(),
         'psnr_vh': psnr_vh.item(),
@@ -316,7 +431,9 @@ def calculate_phase_difference_stats(recon: torch.Tensor, gt: torch.Tensor) -> d
 class MetricsCalculator:
     """Comprehensive metrics calculator for SAR super-resolution."""
     
-    def __init__(self):
+    def __init__(self, psnr_ref: str = 'fixed', eval_window: int = 11):
+        self.psnr_ref = psnr_ref
+        self.eval_window = eval_window
         self.reset()
     
     def reset(self):
@@ -337,7 +454,7 @@ class MetricsCalculator:
                     self.metrics[key].append(value.item())
             
             # Quality metrics - dual polarization
-            psnr_results = calculate_psnr_dual_pol(recon, gt)
+            psnr_results = calculate_psnr_dual_pol(recon, gt, ref=self.psnr_ref)
             self.metrics['psnr_vv'].append(psnr_results['psnr_vv'])
             self.metrics['psnr_vh'].append(psnr_results['psnr_vh'])
             self.metrics['psnr_avg'].append(psnr_results['psnr_avg'])
@@ -349,13 +466,24 @@ class MetricsCalculator:
             recon_complex = _ensure_complex(recon)
             gt_complex = _ensure_complex(gt)
             
-            self.metrics['ssim'].append(calculate_ssim(recon_complex, gt_complex))
+            self.metrics['ssim'].append(calculate_ssim(recon_complex, gt_complex, window_size=self.eval_window))
             self.metrics['cpif'].append(calculate_cpif(recon_complex, gt_complex).item())
             self.metrics['rmse'].append(calculate_rmse(recon, gt))
+
+            # Amplitude maxima for summary
+            amp_pred = torch.abs(recon_complex)
+            amp_gt = torch.abs(gt_complex)
+            self.metrics.setdefault('amp_max_pred', [])
+            self.metrics.setdefault('amp_max_hr', [])
+            self.metrics['amp_max_pred'].append(amp_pred.max().item())
+            self.metrics['amp_max_hr'].append(amp_gt.max().item())
             
             # Phase statistics
             phase_stats = calculate_phase_difference_stats(recon_complex, gt_complex)
             self.metrics['phase_rmse'].append(phase_stats['phase_rmse'])
+            # Back-compat: provide wrapped_phase_rmse alias
+            self.metrics.setdefault('wrapped_phase_rmse', [])
+            self.metrics['wrapped_phase_rmse'].append(phase_stats['phase_rmse'])
     
     def get_average_metrics(self):
         """Get average of accumulated metrics."""

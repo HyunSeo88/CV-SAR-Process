@@ -125,7 +125,8 @@ python model/train.py --dry-run
 - **Current Default**: AC-Swin-UNet++ (`--model-type swin`) - recommended for production
 - **Model Creation**: Always use `create_model()` factory function from `ac_swin_unet_pp.py`
 - **Legacy Model**: Complex U-Net has channel mismatch issues and is not supported in current training
-- **Active Model Path**: `model_weights/version5/acswin_unet_pp.pth` (latest with artifact mitigation)
+- **Active Model Path**: `model_weights/version6/acswin_unet_pp.pth` (latest with residual scaling fix)
+- **Current Architecture**: AC-Swin-UNet++ with resize-based upsampling, ComplexGELU activation
 
 ### SAR-Specific Considerations
 - **Complex Data Handling**: All models preserve both amplitude and phase information
@@ -217,18 +218,26 @@ Training parameters are configured via command-line arguments in `model/train.py
 - **npy2png.py**: Enhanced to correctly identify and process complex SAR data vs real data
 - **Model Loading**: Always use model factory functions, never instantiate model classes directly
 
-### Checkerboard Artifact Mitigation (Current Priority)
-- **Issue**: Models version 4-5 exhibit checkerboard artifacts in super-resolution outputs
-- **Causes**: Potential issues with PixelShuffle upsampling, loss function weighting, or training dynamics
-- **Current Approaches**:
-  - Modified Complex PixelShuffle implementation with improved weight initialization
-  - Adjusted hybrid loss function weighting (amplitude MSE vs phase L1)
-  - Enhanced data augmentation strategies
-  - Regularization techniques to prevent high-frequency artifacts
+### Artifact Mitigation (Current Priority)
+- **Issue**: Models version 4-6 exhibit wavy/irregular pattern artifacts in super-resolution outputs
+- **Root Causes Identified**:
+  - ComplexGELU activation causing phase distortion through magnitude-based gating
+  - SwinBlock overlap normalization creating phase discontinuities
+  - Residual scaling (0.1) too low, causing training instability
+- **Current Solutions (Version 6)**:
+  - **Residual Connection**: Increased to `out * 0.3 + residual * 0.7` for better stability
+  - **Architecture**: Resize-based upsampling instead of PixelShuffle to avoid grid artifacts
+  - **FFT Loss Enhancement**: Replaced amplitude-only FFT with complex spectrum FFT (preserves phase)
+  - **Phase Spectrum Loss**: Added dedicated high-frequency phase consistency loss
+  - **Loss Rebalancing**: TV loss increased to 8e-3 for stronger spatial smoothing
+- **Recommended Next Steps**:
+  - Replace ComplexGELU with ComplexLeakyReLU for phase preservation
+  - Implement Xavier initialization for complex layers
+  - Add phase continuity constraints in loss function
 - **Model Versions**: 
-  - Version 4: Initial checkerboard artifact identification
-  - Version 5: Latest mitigation attempts (ongoing)
-- **Monitoring**: TensorBoard visualization enhanced to detect and analyze artifact patterns
+  - Version 4-5: Initial artifact identification and PixelShuffle experiments
+  - Version 6: Residual scaling fix, ongoing wavy pattern mitigation
+- **Monitoring**: TensorBoard shows both amplitude and phase artifacts; focus on phase consistency
 
 ### Recent Updates and Fixes
 - **Commit 1258390**: Latest checkerboard artifact mitigation strategies implemented

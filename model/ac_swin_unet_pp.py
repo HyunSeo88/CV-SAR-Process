@@ -31,9 +31,14 @@ class ComplexConv2d(nn.Module):
         self.imag = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False, padding_mode='reflect')
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure complex input (some callers may pass real feature maps)
+        if not torch.is_complex(x):
+            # Treat input as real with zero imaginary part
+            x = torch.complex(x, torch.zeros_like(x))
         r = self.real(x.real) - self.imag(x.imag)
         i = self.real(x.imag) + self.imag(x.real)
-        return torch.complex(r, i)
+        # torch.complex does not accept bfloat16; cast components to float32
+        return torch.complex(r.float(), i.float())
 
 class ComplexBN(nn.Module):
     def __init__(self, c: int):
@@ -42,7 +47,36 @@ class ComplexBN(nn.Module):
         self.i = nn.BatchNorm2d(c)
 
     def forward(self, x: torch.Tensor):
-        return torch.complex(self.r(x.real), self.i(x.imag))
+        if not torch.is_complex(x):
+            x = torch.complex(x, torch.zeros_like(x))
+        return torch.complex(self.r(x.real).float(), self.i(x.imag).float())
+
+class ComplexGroupNorm(nn.Module):
+    def __init__(self, num_groups: int, num_channels: int):
+        super().__init__()
+        # Ensure groups divides channels evenly for GroupNorm stability
+        if num_channels % num_groups != 0:
+            num_groups = max(1, min(num_groups, num_channels))
+        self.r = nn.GroupNorm(num_groups, num_channels)
+        self.i = nn.GroupNorm(num_groups, num_channels)
+    def forward(self, x: torch.Tensor):
+        if not torch.is_complex(x):
+            x = torch.complex(x, torch.zeros_like(x))
+        return torch.complex(self.r(x.real).float(), self.i(x.imag).float())
+
+def complex_norm_factory(kind: str = 'gn', groups: int = 8):
+    kind = (kind or 'gn').lower()
+    def make(channels: int):
+        if kind == 'bn':
+            return ComplexBN(channels)
+        if kind == 'gn':
+            g = max(1, int(groups))
+            return ComplexGroupNorm(g, channels)
+        if kind == 'ln':
+            return ComplexGroupNorm(1, channels)  # LN via GroupNorm with 1 group
+        # default
+        return ComplexGroupNorm(max(1, int(groups)), channels)
+    return make
 
 class ComplexGELU(nn.Module):
     def forward(self, x: torch.Tensor):
@@ -92,7 +126,7 @@ class ComplexBlurPool(nn.Module):
         weight = self.kernel.repeat(self.channels, 1, 1, 1)  # [C,1,kH,kW]
         real = F.conv2d(real, weight, stride=self.stride, groups=self.channels)
         imag = F.conv2d(imag, weight, stride=self.stride, groups=self.channels)
-        return torch.complex(real, imag)
+        return torch.complex(real.float(), imag.float())
 
 # ================================================================
 # Complex Resize-based upsampling (anti-checkerboard)
@@ -110,7 +144,7 @@ class ComplexResizeUpsample(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         real = F.interpolate(x.real, scale_factor=self.scale, mode='bilinear', align_corners=False, antialias=True)
         imag = F.interpolate(x.imag, scale_factor=self.scale, mode='bilinear', align_corners=False, antialias=True)
-        x_up = torch.complex(real, imag)
+        x_up = torch.complex(real.float(), imag.float())
         return self.conv(x_up)
 
 # ================================================================
@@ -141,6 +175,8 @@ class ComplexSpatialAttn(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(3, 1, k, padding=k//2, bias=False)
     def forward(self, x):
+        if not torch.is_complex(x):
+            x = torch.complex(x, torch.zeros_like(x))
         # Create spatial attention map using aggregated channel information
         abs_feat = torch.mean(torch.abs(x), dim=1, keepdim=True)      # [B, 1, H, W]
         real_feat = torch.mean(x.real, dim=1, keepdim=True)          # [B, 1, H, W] 
@@ -154,19 +190,19 @@ class ComplexSpatialAttn(nn.Module):
 # ================================================================
 
 class EncBlock(nn.Module):
-    def __init__(self, in_c, out_c):
+    def __init__(self, in_c, out_c, norm_maker=None):
         super().__init__()
         # Anti-aliased downsampling: blur + decimate, then stride-1 conv
         self.blur = ComplexBlurPool(in_c, kernel_size=5, stride=(2, 2))
         self.conv = ComplexConv2d(in_c, out_c, (7, 3), (1, 1), (3, 1))
-        self.bn   = ComplexBN(out_c)
+        self.bn   = (norm_maker or (lambda c: ComplexBN(c)))(out_c)
         self.act  = ComplexGELU()
     def forward(self,x):
         x = self.blur(x)
         return self.act(self.bn(self.conv(x)))
 
 class DecBlock(nn.Module):
-    def __init__(self, in_c, out_c, scale=2, skip_ch=None):
+    def __init__(self, in_c, out_c, scale=2, skip_ch=None, norm_maker=None):
         super().__init__()
         self.up   = ComplexResizeUpsample(in_c, out_c, scale)
         # Calculate input channels for first conv: upsampled + skip features
@@ -175,9 +211,9 @@ class DecBlock(nn.Module):
         else:
             conv_in_ch = out_c + skip_ch  # With skip connection
         self.c1   = ComplexConv2d(conv_in_ch, out_c, 3,1,1)
-        self.b1   = ComplexBN(out_c)
+        self.b1   = (norm_maker or (lambda c: ComplexBN(c)))(out_c)
         self.c2   = ComplexConv2d(out_c, out_c, 3,1,1)
-        self.b2   = ComplexBN(out_c)
+        self.b2   = (norm_maker or (lambda c: ComplexBN(c)))(out_c)
         self.act  = ComplexGELU()
         self.se   = ComplexSE(out_c)
         self.sa   = ComplexSpatialAttn()
@@ -192,7 +228,7 @@ class DecBlock(nn.Module):
 
 class DecBlockResize(nn.Module):
     """Decoder block using bilinear resize + ComplexConv (anti-checkerboard)."""
-    def __init__(self, in_c, out_c, scale=(2, 2), skip_ch=None):
+    def __init__(self, in_c, out_c, scale=(2, 2), skip_ch=None, norm_maker=None):
         super().__init__()
         self.scale = scale
         # Calculate input channels for first conv: upsampled + skip features
@@ -201,9 +237,9 @@ class DecBlockResize(nn.Module):
         else:
             conv_in_ch = in_c + skip_ch
         self.c1   = ComplexConv2d(conv_in_ch, out_c, 3,1,1)
-        self.b1   = ComplexBN(out_c)
+        self.b1   = (norm_maker or (lambda c: ComplexBN(c)))(out_c)
         self.c2   = ComplexConv2d(out_c, out_c, 3,1,1)
-        self.b2   = ComplexBN(out_c)
+        self.b2   = (norm_maker or (lambda c: ComplexBN(c)))(out_c)
         self.act  = ComplexGELU()
         self.se   = ComplexSE(out_c)
         self.sa   = ComplexSpatialAttn()
@@ -211,7 +247,7 @@ class DecBlockResize(nn.Module):
     def _resize(self, x: torch.Tensor) -> torch.Tensor:
         real = F.interpolate(x.real, scale_factor=self.scale, mode='bilinear', align_corners=False, antialias=True)
         imag = F.interpolate(x.imag, scale_factor=self.scale, mode='bilinear', align_corners=False, antialias=True)
-        return torch.complex(real, imag)
+        return torch.complex(real.float(), imag.float())
 
     def forward(self, x, skip):
         x = self._resize(x)
@@ -227,11 +263,13 @@ class DecBlockResize(nn.Module):
 # ================================================================
 
 class ComplexWindowAttn(nn.Module):
-    def __init__(self, dim:int, heads:int, win:Tuple[int,int]):
+    def __init__(self, dim:int, heads:int, win:Tuple[int,int], *, mag_renorm: bool = True, temp: float = 1.0):
         super().__init__()
         self.dim, self.heads = dim, heads
         self.scale = (dim//heads)**-0.5
         self.win = win
+        self.mag_renorm = bool(mag_renorm)
+        self.temp = float(temp) if float(temp) > 0 else 1.0
         self.qkv = ComplexConv2d(dim, dim*3, 1,1,0)
         self.proj= ComplexConv2d(dim, dim, 1,1,0)
         # relative position bias (real-valued) – kept simple
@@ -250,18 +288,28 @@ class ComplexWindowAttn(nn.Module):
         attn = (q@k.transpose(-2,-1).conj())*self.scale
         bias = self.rel[:,self.rel_idx.view(-1)].view(self.heads,*self.rel_idx.shape)
         attn = attn + bias.unsqueeze(0)
-        w = torch.softmax(torch.abs(attn),-1)
-        attn = attn*(w/(torch.abs(attn)+1e-8))
+        
+        # Improved numerical stability for attention computation
+        attn_mag = torch.abs(attn) + 1e-12  # Prevent zero magnitude
+        w = torch.softmax(attn_mag / self.temp, dim=-1)
+        
+        if self.mag_renorm:
+            # Phase-preserving magnitude renormalization
+            attn = attn * (w / attn_mag)
+        else:
+            # Use magnitude-only attention; cast to complex to preserve dtype for matmul
+            attn = w.to(q.dtype)
         out = attn@v
         out = rearrange(out,'b h (hh ww) d -> b (h d) hh ww',hh=self.win[0],ww=self.win[1])
         return self.proj(out)
 
 class SwinBlock(nn.Module):
-    def __init__(self,dim,heads,win=(8,4),stride=(4,2),shift:bool=False):
+    def __init__(self,dim,heads,win=(8,4),stride=(4,2),shift:bool=False, *, norm_maker=None, attn_mag_renorm=True, attn_temp=1.0):
         super().__init__()
         self.win,self.stride,self.shift=win,stride,shift
-        self.attn = ComplexWindowAttn(dim,heads,win)
-        self.n1 = ComplexBN(dim); self.n2 = ComplexBN(dim)
+        self.attn = ComplexWindowAttn(dim,heads,win, mag_renorm=attn_mag_renorm, temp=attn_temp)
+        make_norm = norm_maker or (lambda c: ComplexBN(c))
+        self.n1 = make_norm(dim); self.n2 = make_norm(dim)
         self.mlp= nn.Sequential(ComplexConv2d(dim,dim*4,1,1,0),ComplexGELU(),ComplexConv2d(dim*4,dim,1,1,0))
     def forward(self,x):
         B,C,H,W = x.shape
@@ -299,8 +347,13 @@ class SwinBlock(nn.Module):
         if self.shift:
             x_ = torch.roll(x_, shifts=(self.stride[0]//2, self.stride[1]//2), dims=(2,3))
         
-        x = self.n1(x+x_)
-        x = self.n2(x+self.mlp(x))
+        # Preserve complex information while ensuring float32 components
+        s1 = x + x_
+        s1 = torch.complex(s1.real.float(), s1.imag.float())
+        x = self.n1(s1)
+        s2 = x + self.mlp(x)
+        s2 = torch.complex(s2.real.float(), s2.imag.float())
+        x = self.n2(s2)
         return x
 
 # ================================================================
@@ -308,29 +361,30 @@ class SwinBlock(nn.Module):
 # ================================================================
 
 class ACSwinUNetPP(nn.Module):
-    def __init__(self, base_dim:int=64, heads:int=4, depth:int=4):
+    def __init__(self, base_dim:int=64, heads:int=4, depth:int=4, *, norm: str = 'gn', norm_groups: int = 8, attn_mag_renorm: bool = True, attn_temp: float = 1.0):
         super().__init__()
         # 4-real → 2-complex helper handled in forward
-        self.enc1 = EncBlock(2, base_dim)
-        self.enc2 = EncBlock(base_dim, base_dim*2)
-        self.enc3 = EncBlock(base_dim*2, base_dim*4)
+        make_norm = complex_norm_factory(norm, norm_groups)
+        self.enc1 = EncBlock(2, base_dim, norm_maker=make_norm)
+        self.enc2 = EncBlock(base_dim, base_dim*2, norm_maker=make_norm)
+        self.enc3 = EncBlock(base_dim*2, base_dim*4, norm_maker=make_norm)
         blocks: List[nn.Module] = []
         for i in range(depth):
-            blocks.append(SwinBlock(base_dim*4, heads, win=(8,4), stride=(4,2), shift=(i%2==1)))
+            blocks.append(SwinBlock(base_dim*4, heads, win=(8,4), stride=(4,2), shift=(i%2==1), norm_maker=make_norm, attn_mag_renorm=attn_mag_renorm, attn_temp=attn_temp))
         self.bottleneck = nn.Sequential(*blocks)
         # Three decoder layers to match three encoder layers
-        self.dec3 = DecBlock(base_dim*4, base_dim*2, scale=(2,2), skip_ch=base_dim*2)  # 1/8 -> 1/4, skip e2 
-        self.dec2 = DecBlock(base_dim*2, base_dim, scale=(2,2), skip_ch=base_dim)      # 1/4 -> 1/2, skip e1
-        self.dec1 = DecBlock(base_dim, base_dim//2, scale=(2,2), skip_ch=0)           # 1/2 -> 1/1, no skip
+        self.dec3 = DecBlock(base_dim*4, base_dim*2, scale=(2,2), skip_ch=base_dim*2, norm_maker=make_norm)  # 1/8 -> 1/4, skip e2 
+        self.dec2 = DecBlock(base_dim*2, base_dim, scale=(2,2), skip_ch=base_dim, norm_maker=make_norm)      # 1/4 -> 1/2, skip e1
+        self.dec1 = DecBlock(base_dim, base_dim//2, scale=(2,2), skip_ch=0, norm_maker=make_norm)           # 1/2 -> 1/1, no skip
         # Staged upsampling for super-resolution to reduce grid artifacts
         # 1/1 -> 2x resolution (resize-conv)
-        self.up1 = DecBlockResize(base_dim//2, base_dim//4, scale=(2,2), skip_ch=0)
+        self.up1 = DecBlockResize(base_dim//2, base_dim//4, scale=(2,2), skip_ch=0, norm_maker=make_norm)
         # 2x -> 4x resolution (resize-conv)
-        self.up2 = DecBlockResize(base_dim//4, base_dim//8, scale=(2,2), skip_ch=0)
+        self.up2 = DecBlockResize(base_dim//4, base_dim//8, scale=(2,2), skip_ch=0, norm_maker=make_norm)
         # Final output layer
         self.final = ComplexConv2d(base_dim//8, 2, 3, 1, 1)
     def _real4_to_c2(self,x:torch.Tensor):
-        vv = torch.complex(x[:,0],x[:,1]); vh = torch.complex(x[:,2],x[:,3])
+        vv = torch.complex(x[:,0].float(), x[:,1].float()); vh = torch.complex(x[:,2].float(), x[:,3].float())
         return torch.stack([vv,vh],1)
     def _c2_to_real4(self,x:torch.Tensor):
         vv,vh = x[:,0],x[:,1]
@@ -350,9 +404,9 @@ class ACSwinUNetPP(nn.Module):
         sr2 = self.up2(sr1, None)  # 4x resolution
         out = self.final(sr2)      # 4x resolution, 2 complex channels
         # Residual connection with scaled output for training stability
-        residual_real = F.interpolate(x, size=out.shape[-2:], mode='bilinear', align_corners=False)
+        residual_real = F.interpolate(x.float(), size=out.shape[-2:], mode='bilinear', align_corners=False)
         residual = self._real4_to_c2(residual_real)
-        out = out * 0.1 + residual
+        out = out * 0.3 + residual*0.7 #위상 점프 방지 (구불구불한 무늬 아티팩트 개선 시도)
         return self._c2_to_real4(out)
 
 
@@ -360,8 +414,8 @@ class ACSwinUNetPP(nn.Module):
         """Return number of trainable parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-def create_model():
-    return ACSwinUNetPP()
+def create_model(**kwargs):
+    return ACSwinUNetPP(**kwargs)
 
 if __name__ == "__main__":
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'

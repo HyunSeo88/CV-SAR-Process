@@ -13,6 +13,7 @@ Designed for Korean disaster monitoring applications.
 """
 
 import os
+import shutil  # For rebuilding LR cache
 import sys
 import time
 import pickle
@@ -39,6 +40,7 @@ GradScaler = amp.GradScaler
 
 # Import utils always
 from utils import sr_loss, MetricsCalculator, PerceptualLoss
+from degradations import degrade_from_params, LPParams, build_meta
 
 # Provide a default model factory to satisfy static references; CLI may override at runtime
 try:
@@ -59,7 +61,8 @@ class SARSuperResDataset(Dataset):
     """
     
     def __init__(self, file_list: list, data_dir: str, lr_size: Tuple[int, int] = (128, 64),
-                 hr_size: Tuple[int, int] = (512, 256), *, use_cache: bool = True, gpu_degrade: bool = False):
+                 hr_size: Tuple[int, int] = (512, 256), *, use_cache: bool = True, gpu_degrade: bool = False,
+                 lr_mode: str = 'complex_lp', lp_kind: str = 'gaussian', lp_sigma: float = 1.2, lp_size: int = 9, lp_beta: float = 12.0):
 
         """
         Initialize SAR dataset
@@ -76,6 +79,8 @@ class SARSuperResDataset(Dataset):
         self.hr_size = hr_size
         self.use_cache = use_cache
         self.gpu_degrade = gpu_degrade
+        self.lr_mode = lr_mode
+        self.lp_params = LPParams(kind=lp_kind, sigma_px=lp_sigma, size=lp_size, beta=lp_beta)
         
         print(f"Initialized dataset with {len(self.hr_files)} SAR patches.")
         
@@ -100,35 +105,39 @@ class SARSuperResDataset(Dataset):
         self.hr_files = [f"synthetic_{i}.npy" for i in range(n_samples)]
     
     def _simulate_lr_from_hr(self, hr_data: np.ndarray) -> np.ndarray:
-        """Resolution-scaled SAR 열화 시뮬레이션(RSS)"""
-        # 0) 디바이스 선택
+        """Resolution-scaled SAR degradation according to selected lr_mode."""
         use_gpu = self.gpu_degrade and torch.cuda.is_available()
         device  = torch.device("cuda") if use_gpu else torch.device("cpu")
+        # Delegate to degradations.py
+        # Ensure complex tensor layout (2,H,W) complex for degradations
+        if isinstance(hr_data, np.ndarray) and np.iscomplexobj(hr_data):
+            hr_complex_np = hr_data.astype(np.complex64)
+        else:
+            # Fallback: construct complex from stacked real/imag
+            hr_complex_np = hr_data[0] + 1j * hr_data[1]
+        # Convert to torch complex [2,H,W]
+        hr_c = torch.stack([
+            torch.from_numpy(hr_complex_np[0]).to(device),
+            torch.from_numpy(hr_complex_np[1]).to(device)
+        ], dim=0).to(torch.complex64)
 
-        # HR 복소 텐서 로드 → (2, H, W)
-        hr = torch.from_numpy(hr_data).to(device, non_blocking=False)
+        # Degrade on device and return numpy complex64
+        H, W = self.hr_size
+        h, w = self.lr_size
+        assert hr_c.shape[-2:] == (H, W), f"HR shape mismatch: got {hr_c.shape[-2:]}, expected {(H,W)}"
 
-        # 스케일 = HR/LR 비
-        scale = self.hr_size[0] // self.lr_size[0]      # ex. 4
-        assert hr.shape[-2:] == self.hr_size, f"HR shape mismatch: got {hr.shape[-2:]}, expected {self.hr_size}"
+        # Choose mode with AMP disabled to keep float32 stability
+        with autocast(device_type='cuda', enabled=False):
+            if self.lr_mode == 'complex_lp':
+                from degradations import degrade_complex_lp
+                lr_c = degrade_complex_lp(hr_c, H // h, self.lp_params, device)
+            else:
+                from degradations import degrade_mean_amp_phase
+                lr_c = degrade_mean_amp_phase(hr_c, H // h)
 
-        # 1) 평균 전력 → √: 물리적 스케일 정합을 위해 평균으로 다운샘플
-        power = (hr.real**2 + hr.imag**2).unsqueeze(0)       # (1,2,H,W)
-        power_avg = F.avg_pool2d(power, scale, stride=scale) # 평균 = (1/|K|)∑|z|²
-        amp_lr = power_avg.sqrt().squeeze(0)                 # (2,H/4,W/4)
-        
-        # 2) 위상 평균
-        phase = torch.angle(hr).unsqueeze(0)                    # (1,2,H,W)
-        # depth-wise 평균을 위해 cos/sin → 같은 커널 사용
-        cos_p = F.avg_pool2d(torch.cos(phase), scale, stride=scale)
-        sin_p = F.avg_pool2d(torch.sin(phase), scale, stride=scale)
-        phase_lr = torch.atan2(sin_p, cos_p).squeeze(0)
-
-        # 3) 재조합 (complex)
-        lr_complex = amp_lr * torch.exp(1j * phase_lr)
-
-        # 4) CPU 반환 - DataLoader 워커 ≥1 이어도 CUDA 컨텍스트 해제
-        return lr_complex.to("cpu").numpy().astype(np.complex64)
+        # Back to numpy complex64 (2,h,w)
+        lr_np = lr_c.detach().to('cpu').numpy().astype(np.complex64)  # complex dtype
+        return lr_np
     
     def __len__(self):
         return len(self.hr_files)
@@ -162,7 +171,10 @@ class SARSuperResDataset(Dataset):
         
         # Generate or load corresponding LR patch
         if not hasattr(self, 'synthetic_data') and self.use_cache:
-            lr_data = load_or_compute_lr(Path(hr_file), self._simulate_lr_from_hr, hr_data)
+            # Add meta so that cache is reused only when parameters match
+            scale = self.hr_size[0] // self.lr_size[0]
+            meta = build_meta(self.lr_mode, scale, self.lp_params)
+            lr_data = load_or_compute_lr(Path(hr_file), self._simulate_lr_from_hr, hr_data, meta=meta)
         else:
             lr_data = self._simulate_lr_from_hr(hr_data)
         
@@ -206,7 +218,8 @@ class EarlyStopping:
         return False
 
 
-def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0, *, use_cache: bool = True, gpu_degrade: bool = False, max_samples: int = None):
+def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0, *, use_cache: bool = True, gpu_degrade: bool = False, max_samples: int = None,
+                       lr_mode: str = 'complex_lp', lp_kind: str = 'gaussian', lp_sigma: float = 1.2, lp_size: int = 9, lp_beta: float = 12.0):
     """
     Create train and validation dataloaders
     
@@ -288,8 +301,10 @@ def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0
         print(f"Saved new file splits to cache: {cache_path}")
 
     # Create datasets with pre-split file lists
-    train_dataset = SARSuperResDataset(file_splits['train'], data_dir, use_cache=use_cache, gpu_degrade=gpu_degrade)
-    val_dataset = SARSuperResDataset(file_splits['val'], data_dir, use_cache=use_cache, gpu_degrade=gpu_degrade)
+    train_dataset = SARSuperResDataset(file_splits['train'], data_dir, use_cache=use_cache, gpu_degrade=gpu_degrade,
+                                       lr_mode=lr_mode, lp_kind=lp_kind, lp_sigma=lp_sigma, lp_size=lp_size, lp_beta=lp_beta)
+    val_dataset = SARSuperResDataset(file_splits['val'], data_dir, use_cache=use_cache, gpu_degrade=gpu_degrade,
+                                     lr_mode=lr_mode, lp_kind=lp_kind, lp_sigma=lp_sigma, lp_size=lp_size, lp_beta=lp_beta)
     
     # PERF: Optimized DataLoader settings - pin_memory=False for better stability
     train_loader = DataLoader(
@@ -313,7 +328,9 @@ def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0
     return train_loader, val_loader
 
 
-def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual, scaler, profiler=None, *, perceptual_weight: float = 0.0, fft_weight: float = 0.0):
+def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual, scaler, profiler=None, *, perceptual_weight: float = 0.0, fft_weight: float = 0.0, amp_enabled: bool = True, amp_dtype=torch.bfloat16,
+                phase_coh_weight_on: bool = True, phase_coh_p: float = 1.0, phase_window: int = 7,
+                peak_boost_on: bool = True, peak_topk: float = 95.0, peak_weight: float = 0.05):
     """
     Train for one epoch
     
@@ -340,7 +357,7 @@ def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual
         
         # PERF: Wrap forward and backward in AMP autocast and scaler
         optimizer.zero_grad()
-        with autocast(device_type='cuda', enabled=device.type=='cuda', dtype=torch.float32):
+        with autocast(device_type='cuda', enabled=amp_enabled and device.type=='cuda', dtype=amp_dtype):
             pred_hr = model(lr_batch)
             
             # FIX: Shape guard to ensure pred_hr and hr_batch dimensions match
@@ -351,7 +368,17 @@ def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual
                 hr_batch = hr_batch[..., :h, :w]
             
             # Calculate loss
-            loss_components = sr_loss(pred_hr.float(), hr_batch, perceptual, perceptual_weight=perceptual_weight, fft_weight=fft_weight)
+            loss_components = sr_loss(
+                pred_hr.float(), hr_batch, perceptual,
+                perceptual_weight=perceptual_weight,
+                fft_weight=fft_weight,
+                phase_coh_weight_on=phase_coh_weight_on,
+                phase_coh_p=phase_coh_p,
+                phase_window=phase_window,
+                peak_boost_on=peak_boost_on,
+                peak_topk=peak_topk,
+                peak_weight=peak_weight,
+            )
             
             # Handle both dict (new) and tuple (old) formats
             if isinstance(loss_components, dict):
@@ -361,6 +388,9 @@ def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual
         
         # PERF: Scale loss and backward
         scaler.scale(total_loss_val).backward()
+        # FIX D: Gradient clipping with AMP unscale to prevent spikes
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
         
@@ -384,7 +414,9 @@ def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual
     return total_loss / max(total_samples, 1)
 
 
-def validate_epoch(model, val_loader, device, metrics_calc, perceptual, *, perceptual_weight: float = 0.0, fft_weight: float = 0.0):
+def validate_epoch(model, val_loader, device, metrics_calc, perceptual, *, perceptual_weight: float = 0.0, fft_weight: float = 0.0, amp_enabled: bool = True, amp_dtype=torch.bfloat16,
+                   phase_coh_weight_on: bool = True, phase_coh_p: float = 1.0, phase_window: int = 7,
+                   peak_boost_on: bool = True, peak_topk: float = 95.0, peak_weight: float = 0.05):
     """
     Validate for one epoch
     
@@ -406,7 +438,7 @@ def validate_epoch(model, val_loader, device, metrics_calc, perceptual, *, perce
     
     # PERF: Use autocast for validation forward pass
     with torch.no_grad():
-        with autocast(device_type='cuda', enabled=device.type=='cuda', dtype=torch.float32):
+        with autocast(device_type='cuda', enabled=amp_enabled and device.type=='cuda', dtype=amp_dtype):
             for lr_batch, hr_batch in val_loader:
                 lr_batch = lr_batch.to(device, non_blocking=True)
                 hr_batch = hr_batch.to(device, non_blocking=True)
@@ -422,7 +454,17 @@ def validate_epoch(model, val_loader, device, metrics_calc, perceptual, *, perce
                     hr_batch = hr_batch[..., :h, :w]
                 
                 # Calculate loss
-                loss_components = sr_loss(pred_hr.float(), hr_batch, perceptual, perceptual_weight=perceptual_weight, fft_weight=fft_weight)
+                loss_components = sr_loss(
+                    pred_hr.float(), hr_batch, perceptual,
+                    perceptual_weight=perceptual_weight,
+                    fft_weight=fft_weight,
+                    phase_coh_weight_on=phase_coh_weight_on,
+                    phase_coh_p=phase_coh_p,
+                    phase_window=phase_window,
+                    peak_boost_on=peak_boost_on,
+                    peak_topk=peak_topk,
+                    peak_weight=peak_weight,
+                )
                 
                 # Handle both dict (new) and tuple (old) formats
                 if isinstance(loss_components, dict):
@@ -443,11 +485,12 @@ def validate_epoch(model, val_loader, device, metrics_calc, perceptual, *, perce
 
 def log_images_to_tensorboard(writer, lr_batch, hr_batch, pred_batch, epoch, num_images=1, fixed_range=(0.001, 10.0)):
     """
-    Logs SAR image visualizations to TensorBoard with consistent normalization.
-    - Uses adaptive normalization for clear visualization.
-    - Calculates VV and VH amplitude correctly.
-    - Upscales LR image for consistent visualization size.
-    - All images (Raw, LR, HR, SR) come from the same source patch for meaningful comparison.
+    Logs SAR image visualizations to TensorBoard using a FIXED dB normalization range
+    for consistent comparison across epochs and runs.
+    - Fixed dB range normalization (recommended for trend comparison)
+    - Calculates VV and VH amplitude correctly
+    - Upscales LR image for consistent visualization size
+    - All images (Raw, LR, HR, SR) come from the same source patch for meaningful comparison
     
     Args:
         lr_batch: LR 4-channel real data (batch_size, 4, h, w)
@@ -455,7 +498,7 @@ def log_images_to_tensorboard(writer, lr_batch, hr_batch, pred_batch, epoch, num
         pred_batch: SR 4-channel real data (batch_size, 4, H, W)
         epoch: Current training epoch
         num_images: Number of images to display (typically 1 for clarity)
-        fixed_range: Tuple of (min_db, max_db) for reference (not used with adaptive normalization)
+        fixed_range: Tuple of (min_db, max_db) used for dB normalization
     """
     num_images = min(num_images, lr_batch.shape[0])
     hr_size = (hr_batch.shape[2], hr_batch.shape[3]) # e.g., (512, 256)
@@ -496,17 +539,6 @@ def log_images_to_tensorboard(writer, lr_batch, hr_batch, pred_batch, epoch, num
         norm_amp = torch.where(torch.isfinite(norm_amp), norm_amp, torch.tensor(0.0, device=norm_amp.device))
         # Add channel dimension for grayscale images
         return norm_amp.unsqueeze(1)
-    
-    def normalize_for_display_adaptive(amp_tensor):
-        # Adaptive normalization for individual tensor
-        log_amp = 20 * torch.log10(amp_tensor + 1e-8)
-        min_db = log_amp.min()
-        max_db = log_amp.max()
-        norm_amp = (log_amp - min_db) / (max_db - min_db + 1e-8)
-        norm_amp = norm_amp.clamp(0, 1)
-        # Check for NaN/Inf and replace with 0
-        norm_amp = torch.where(torch.isfinite(norm_amp), norm_amp, torch.tensor(0.0, device=norm_amp.device))
-        return norm_amp.unsqueeze(1)
 
     min_db, max_db = fixed_range
     
@@ -521,10 +553,10 @@ def log_images_to_tensorboard(writer, lr_batch, hr_batch, pred_batch, epoch, num
     # Note: LR_Input_Upscaled shows degraded version of HR (4x4 block averaging + bilinear upscale)
     # It should appear blurred compared to HR_Target due to information loss in LR generation
     try:
-        # Use adaptive normalization for clear visualization
-        vv_hr_norm = normalize_for_display_adaptive(hr_amp_vv)  # HR Target (ground truth)
-        vv_lr_norm = normalize_for_display_adaptive(lr_amp_vv_up)
-        vv_pred_norm = normalize_for_display_adaptive(pred_amp_vv)
+        # Use fixed dB range for consistent visualization across epochs
+        vv_hr_norm = normalize_for_display_fixed_range(hr_amp_vv, min_db, max_db)  # HR Target (ground truth)
+        vv_lr_norm = normalize_for_display_fixed_range(lr_amp_vv_up, min_db, max_db)
+        vv_pred_norm = normalize_for_display_fixed_range(pred_amp_vv, min_db, max_db)
         
         writer.add_images('SAR_Images_VV/1_HR_Target', vv_hr_norm, epoch)
         writer.add_images('SAR_Images_VV/2_LR_Input_Upscaled', vv_lr_norm, epoch)
@@ -534,9 +566,9 @@ def log_images_to_tensorboard(writer, lr_batch, hr_batch, pred_batch, epoch, num
 
     # --- VH Polarization Visualization ---
     try:
-        vh_hr_norm = normalize_for_display_adaptive(hr_amp_vh)  # HR Target (ground truth)
-        vh_lr_norm = normalize_for_display_adaptive(lr_amp_vh_up)
-        vh_pred_norm = normalize_for_display_adaptive(pred_amp_vh)
+        vh_hr_norm = normalize_for_display_fixed_range(hr_amp_vh, min_db, max_db)  # HR Target (ground truth)
+        vh_lr_norm = normalize_for_display_fixed_range(lr_amp_vh_up, min_db, max_db)
+        vh_pred_norm = normalize_for_display_fixed_range(pred_amp_vh, min_db, max_db)
         
         writer.add_images('SAR_Images_VH/1_HR_Target', vh_hr_norm, epoch)
         writer.add_images('SAR_Images_VH/2_LR_Input_Upscaled', vh_lr_norm, epoch)
@@ -619,6 +651,28 @@ def train_model(
     num_workers: int = 0,
     max_samples: int = None,
     resume_checkpoint_path: str = None,
+    rebuild_lr_cache: bool = False,
+    psnr_ref: str = 'fixed',
+    amp: str = 'bf16',
+    # LR degradation parameters
+    lr_mode: str = 'complex_lp',
+    lp_kind: str = 'gaussian',
+    lp_sigma: float = 1.2,
+    lp_size: int = 9,
+    lp_beta: float = 12.0,
+    # Phase/peak loss parameters
+    phase_coh_weight: str = 'on',
+    phase_coh_p: float = 1.0,
+    phase_window: int = 7,
+    peak_boost: str = 'on',
+    peak_topk: float = 95.0,
+    peak_weight: float = 0.05,
+    # Model architecture parameters
+    norm: str = 'gn',
+    norm_groups: int = 8,
+    attn_mag_renorm: str = 'on',
+    attn_temp: float = 1.0,
+    eval_window: int = 7,
 ):
     """
     Main training function with TensorBoard logging
@@ -641,14 +695,34 @@ def train_model(
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
+    # Setup AMP precision
+    amp_enabled = amp != 'off'
+    amp_dtype = {
+        'off': torch.float32,
+        'fp16': torch.float16, 
+        'bf16': torch.bfloat16
+    }[amp]
+    
+    if amp_enabled:
+        print(f"AMP enabled with dtype: {amp_dtype}")
+    else:
+        print("AMP disabled")
+    
     # Setup TensorBoard logging
     writer = None
     if enable_tensorboard:
         writer = setup_tensorboard_logging(tensorboard_log_dir)
     
     # Create model
-    print("\nCreating ComplexUNet model...")
-    model = create_model()
+    print("\nCreating model...")
+    # Model kwargs from function parameters
+    model_kwargs = {
+        'norm': norm,
+        'norm_groups': norm_groups,
+        'attn_mag_renorm': True if attn_mag_renorm == 'on' else False,
+        'attn_temp': float(attn_temp),
+    }
+    model = create_model(**model_kwargs)
     model.to(device)
     
     # Instantiate PerceptualLoss only when enabled and weight > 0
@@ -668,11 +742,32 @@ def train_model(
     
     # DataLoader workers already passed via parameter; keeping as is
     
+    # Optionally rebuild LR cache before loading data
+    if rebuild_lr_cache:
+        try:
+            root = Path(data_dir)
+            removed = 0
+            for p in root.rglob('lr_cache'):
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                    removed += 1
+            print(f"Rebuilt LR cache: removed {removed} 'lr_cache' directories under {data_dir}")
+        except Exception as e:
+            print(f"Warning: Failed to rebuild LR cache: {e}")
+
     # Create dataloaders
     print(f"\nLoading data from {data_dir}...")
     if max_samples is not None:
         print(f"Limiting dataset to {max_samples} samples")
-    train_loader, val_loader = create_dataloaders(data_dir, batch_size, num_workers, use_cache=use_cache, gpu_degrade=gpu_degrade, max_samples=max_samples)
+    train_loader, val_loader = create_dataloaders(
+        data_dir, batch_size, num_workers,
+        use_cache=use_cache, gpu_degrade=gpu_degrade, max_samples=max_samples,
+        lr_mode=lr_mode,
+        lp_kind=lp_kind,
+        lp_sigma=lp_sigma,
+        lp_size=lp_size,
+        lp_beta=lp_beta,
+    )
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     
     # Setup optimizer and scheduler for better convergence
@@ -741,8 +836,8 @@ def train_model(
     )
     
     # Metrics calculators
-    train_metrics = MetricsCalculator()
-    val_metrics = MetricsCalculator()
+    train_metrics = MetricsCalculator(psnr_ref=psnr_ref, eval_window=eval_window)
+    val_metrics = MetricsCalculator(psnr_ref=psnr_ref, eval_window=eval_window)
     
     best_val_loss = float('inf')
     start_time = time.time()
@@ -760,12 +855,32 @@ def train_model(
             
             # Training
             print("Training...")
-            train_loss = train_epoch(model, train_loader, optimizer, device, train_metrics, perceptual, scaler, profiler, perceptual_weight=perceptual_weight, fft_weight=fft_weight)
+            train_loss = train_epoch(
+                model, train_loader, optimizer, device, train_metrics, perceptual, scaler, profiler,
+                perceptual_weight=perceptual_weight, fft_weight=fft_weight,
+                amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                phase_coh_weight_on=(phase_coh_weight=='on'),
+                phase_coh_p=phase_coh_p,
+                phase_window=phase_window,
+                peak_boost_on=(peak_boost=='on'),
+                peak_topk=peak_topk,
+                peak_weight=peak_weight,
+            )
             train_avg_metrics = train_metrics.get_average_metrics()
             
             # Validation
             print("Validating...")
-            val_loss = validate_epoch(model, val_loader, device, val_metrics, perceptual, perceptual_weight=perceptual_weight, fft_weight=fft_weight)
+            val_loss = validate_epoch(
+                model, val_loader, device, val_metrics, perceptual,
+                perceptual_weight=perceptual_weight, fft_weight=fft_weight,
+                amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                phase_coh_weight_on=(phase_coh_weight=='on'),
+                phase_coh_p=phase_coh_p,
+                phase_window=phase_window,
+                peak_boost_on=(peak_boost=='on'),
+                peak_topk=peak_topk,
+                peak_weight=peak_weight,
+            )
             val_avg_metrics = val_metrics.get_average_metrics()
             
             # Update history
@@ -798,6 +913,21 @@ def train_model(
                 writer.add_scalar('RMSE/Val', val_avg_metrics.get('rmse', 0), epoch)
                 writer.add_scalar('CPIF/Val', val_avg_metrics.get('cpif', 0), epoch)
                 writer.add_scalar('Learning_Rate', current_lr, epoch)
+                
+                # Phase quality metrics (Val only)
+                writer.add_scalar('PhaseMetrics/Val_PhaseRMSE', val_avg_metrics.get('wrapped_phase_rmse', 0), epoch)
+                writer.add_scalar('PhaseMetrics/Val_PhaseFFT', val_avg_metrics.get('phase_fft_loss', 0), epoch)
+
+                # Log loss components (Train/Val) and weights
+                for k in ['log_amp_loss','phase_loss','complex_l1','fft_loss','phase_fft_loss','tv_loss','perceptual_loss','phase_coh_loss','peak_loss']:
+                    if k in train_avg_metrics:
+                        writer.add_scalar(f'LossComponents/Train_{k}', train_avg_metrics[k], epoch)
+                    if k in val_avg_metrics:
+                        writer.add_scalar(f'LossComponents/Val_{k}', val_avg_metrics[k], epoch)
+                writer.add_scalar('LossWeights/fft_weight', fft_weight, epoch)
+                writer.add_scalar('LossWeights/perceptual_weight', perceptual_weight, epoch)
+                writer.add_scalar('LossWeights/peak_weight', peak_weight, epoch)
+                writer.add_scalar('LossWeights/phase_coh_p', phase_coh_p, epoch)
                 
                 # Log images
                 if epoch % 5 == 0 or epoch == num_epochs - 1: # Log every 5 epochs or at the end
@@ -851,6 +981,14 @@ def train_model(
             print(f"  Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
             print(f"  Train PSNR - VV: {train_avg_metrics.get('psnr_vv', 0):.2f} dB, VH: {train_avg_metrics.get('psnr_vh', 0):.2f} dB, Avg: {train_avg_metrics.get('psnr_avg', 0):.2f} dB")
             print(f"  Val PSNR - VV: {val_avg_metrics.get('psnr_vv', 0):.2f} dB, VH: {val_avg_metrics.get('psnr_vh', 0):.2f} dB, Avg: {val_avg_metrics.get('psnr_avg', 0):.2f} dB")
+            print(f"  Val PhaseRMSE(rad): {val_avg_metrics.get('wrapped_phase_rmse', 0):.4f}")
+            # One-line standardized summary
+            vv = val_avg_metrics.get('psnr_vv', 0.0); vh = val_avg_metrics.get('psnr_vh', 0.0)
+            phrmse = val_avg_metrics.get('wrapped_phase_rmse', 0.0)
+            cpif = val_avg_metrics.get('cpif', 0.0)
+            ampmax_pred = val_avg_metrics.get('amp_max_pred', 0.0)
+            ampmax_hr = val_avg_metrics.get('amp_max_hr', 0.0)
+            print(f"Val: PSNR(VV/VH,{psnr_ref} ref)={vv:.2f}/{vh:.2f} / PhaseRMSE={phrmse:.4f}rad / CPIF={cpif:.2f} / AmpMax(Pred/HR)={ampmax_pred:.4f}/{ampmax_hr:.4f}")
             # Per-epoch amplitude sanity check on a fixed validation sample
             try:
                 sample_idx = 0
@@ -1000,10 +1138,34 @@ if __name__ == "__main__":
     parser.add_argument('--dry-run', action='store_true', help='Run single forward pass and exit')
     parser.add_argument('--no-perceptual', action='store_true', help='Disable perceptual VGG loss (deprecated; use --perceptual-weight=0.0)')
     parser.add_argument('--perceptual-weight', type=float, default=0.0, help='Weight for perceptual loss (default 0.0 disables VGG)')
-    parser.add_argument('--fft-weight', type=float, default=0.02, help='Weight for high-frequency weighted FFT loss (0.0 to disable)')
+    parser.add_argument('--fft-weight', type=float, default=0.01, help='Weight for high-frequency weighted FFT loss (0.0 to disable)')
+    # LR degradation options
+    parser.add_argument('--lr-mode', choices=['complex_lp', 'mean_amp_phase'], default='complex_lp', help='LR generation mode')
+    parser.add_argument('--lp-kind', choices=['gaussian','sinc'], default='gaussian', help='Low-pass PSF kind')
+    parser.add_argument('--lp-sigma', type=float, default=1.2, help='PSF sigma in pixels')
+    parser.add_argument('--lp-size', type=int, default=9, help='PSF kernel size (odd)')
+    parser.add_argument('--lp-beta', type=float, default=12.0, help='Kaiser beta (sinc only)')
+    # Phase/peak losses
+    parser.add_argument('--phase-coh-weight', choices=['on','off'], default='on', help='Enable coherence-weighted phase loss')
+    parser.add_argument('--phase-coh-p', type=float, default=1.0, help='Exponent p for coherence weighting')
+    parser.add_argument('--phase-window', type=int, default=7, help='Local window size for phase/coherence metrics')
+    parser.add_argument('--peak-boost', choices=['on','off'], default='on', help='Enable peak-boost amplitude L1')
+    parser.add_argument('--peak-topk', type=float, default=95.0, help='Top P%% amplitude mask for peak boost')
+    parser.add_argument('--peak-weight', type=float, default=0.05, help='Weight for peak-boost amplitude loss')
+    # Norm and attention toggles
+    parser.add_argument('--norm', choices=['bn','gn','ln'], default='gn', help='Normalization kind in complex blocks')
+    parser.add_argument('--norm-groups', type=int, default=8, help='Groups for GroupNorm when --norm=gn')
+    parser.add_argument('--attn-mag-renorm', choices=['on','off'], default='on', help='Magnitude re-normalization of attention weights')
+    parser.add_argument('--attn-temp', type=float, default=1.0, help='Softmax temperature in attention')
+    # Eval window for local metrics
+    parser.add_argument('--eval-window', type=int, default=7, help='Window size for local evaluation metrics (SSIM, etc.)')
     parser.add_argument('--auto-workers', action='store_true', help='Use optimal DataLoader workers automatically')
     parser.add_argument('--max-samples', type=int, default=None, help='Maximum number of samples to use (None for all data)')
     parser.add_argument('--resume', type=str, default=None, help='Resume training from checkpoint file')
+    parser.add_argument('--rebuild-lr-cache', action='store_true', help='Delete and rebuild LR cache before training')
+    parser.add_argument('--psnr-ref', choices=['fixed', 'per_dataset'], default='fixed', help='PSNR reference: fixed constants or per-dataset max values')
+    parser.add_argument('--amp', choices=['off', 'fp16', 'bf16'], default='bf16', help='AMP precision: off, fp16, or bf16 (default: bf16)')
+    parser.add_argument('--num-epochs', type=int, default=None, help='Override default number of training epochs (e.g., 1 for quick dry-run)')
     args = parser.parse_args()
 
     # Set multiprocessing start method to avoid CUDA init deadlocks
@@ -1045,7 +1207,43 @@ if __name__ == "__main__":
         'fft_weight': args.fft_weight,
         'max_samples': args.max_samples,
         'resume_checkpoint_path': args.resume,
+        'rebuild_lr_cache': args.rebuild_lr_cache,
+        'psnr_ref': args.psnr_ref,
+        'amp': args.amp,
+        # LR degradation
+        'lr_mode': args.lr_mode,
+        'lp_kind': args.lp_kind,
+        'lp_sigma': args.lp_sigma,
+        'lp_size': args.lp_size,
+        'lp_beta': args.lp_beta,
+        # Loss toggles
+        'phase_coh_weight': args.phase_coh_weight,
+        'phase_coh_p': args.phase_coh_p,
+        'phase_window': args.phase_window,
+        'peak_boost': args.peak_boost,
+        'peak_topk': args.peak_topk,
+        'peak_weight': args.peak_weight,
+        # Norm/Attention
+        'norm': args.norm,
+        'norm_groups': args.norm_groups,
+        'attn_mag_renorm': args.attn_mag_renorm,
+        'attn_temp': args.attn_temp,
+        # Eval
+        'eval_window': args.eval_window,
     }
+
+    # Optional override of num_epochs from CLI for quick tests
+    if args.num_epochs is not None:
+        config['num_epochs'] = int(args.num_epochs)
+    
+    # Validate critical parameter combinations
+    if config.get('peak_boost') == 'on' and config.get('peak_weight', 0.0) <= 0.0:
+        print("Warning: peak_boost=on but peak_weight=0.0, disabling peak_boost")
+        config['peak_boost'] = 'off'
+    
+    if config.get('phase_coh_weight') == 'on' and config.get('phase_window', 0) <= 0:
+        print("Warning: phase_coh_weight=on but invalid phase_window, using default=7")
+        config['phase_window'] = 7
     
     # PERF: Auto-adjust batch size if flag set
     if args.batch_size_auto:
