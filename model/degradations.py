@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Degradation operators for synthetic LR generation from HR complex SAR patches
------------------------------------------------------------------------------
+------------------------------------------------------------------------------
 
 Two LR generation modes controlled via CLI:
 - complex_lp: Convolve complex HR field with a low-pass PSF then decimate
@@ -10,6 +10,13 @@ Two LR generation modes controlled via CLI:
 All convolutions use reflect padding and kernels are energy-normalized.
 The decimation factor is inferred from (hr_size / lr_size), which must be
 an integer ratio in both height and width.
+
+Notes on physical consistency:
+- [연구질문.md §4.1, L52-L59] Data Consistency requires a forward operator H (PSF)
+  and decimator D. We implement H via low-pass PSF and D via strided decimation
+  after anti-alias filtering.
+- [연구질문.md §4.3, L74-L99] Optional multiplicative speckle (Gamma ENL) and
+  thermal noise floor (additive complex Gaussian) are provided for LR synthesis.
 """
 from __future__ import annotations
 
@@ -27,10 +34,11 @@ class LPParams:
     sigma_px: float = 1.2
     size: int = 9           # odd kernel size
     beta: float = 12.0      # kaiser window beta (used for 'sinc')
+    cutoff: float | None = None  # normalized cutoff (0..0.5 Nyquist units), used when kind='sinc'
 
     def to_meta(self) -> Dict:
         d = asdict(self)
-        d['meta_version'] = 1
+        d['meta_version'] = 2
         return d
 
 
@@ -38,7 +46,7 @@ def _ensure_odd(n: int) -> int:
     return int(n) if int(n) % 2 == 1 else int(n) + 1
 
 
-def make_psf(kind: str, sigma_px: float, size: int, beta: float = 12.0, device: torch.device = torch.device('cpu')) -> torch.Tensor:
+def make_psf(kind: str, sigma_px: float, size: int, beta: float = 12.0, device: torch.device = torch.device('cpu'), *, cutoff: float | None = None) -> torch.Tensor:
     """
     Create a 2D low-pass PSF kernel.
 
@@ -57,11 +65,13 @@ def make_psf(kind: str, sigma_px: float, size: int, beta: float = 12.0, device: 
         sigma = max(1e-6, float(sigma_px))
         k = torch.exp(-(rr ** 2) / (2.0 * (sigma ** 2)))
     elif kind.lower() == 'sinc':
-        # Ideal low-pass with cutoff ~ 1/(pi*sigma)
-        # Avoid div by zero at center: sinc(0) = 1
+        # Ideal low-pass with normalized cutoff (cycles/sample). If cutoff is None,
+        # map from sigma as a fallback.
         eps = 1e-8
-        # Empirical mapping: smaller sigma -> wider passband
-        cutoff = 1.0 / max(1.0, float(np.pi * sigma_px))
+        if cutoff is None:
+            # Empirical mapping from sigma to cutoff (ASSUMPTION)
+            cutoff = 0.45 / max(1.0, float(sigma_px))
+        cutoff = float(cutoff)
         r = rr * cutoff
         k = torch.sin(np.pi * r + eps) / (np.pi * r + eps)
         # Kaiser window to control sidelobes
@@ -98,10 +108,60 @@ def _conv2d_reflect(x: torch.Tensor, kernel: torch.Tensor, groups: int) -> torch
     return F.conv2d(x, weight, stride=1, padding=0, groups=groups)
 
 
-def degrade_complex_lp(hr_complex: torch.Tensor, scale: int, lp_params: LPParams, device: torch.device) -> torch.Tensor:
+# -----------------------------------------------------------------------------
+# Speckle (Gamma ENL) and Thermal Noise utilities
+# -----------------------------------------------------------------------------
+
+def _apply_multiplicative_speckle(c: torch.Tensor, enl: float) -> torch.Tensor:
     """
-    hr_complex: Tensor [2,H,W] complex or stacked real-imag as complex dtype
+    Apply multiplicative speckle with ENL=L on intensity, phase-safe for SLC.
+    [연구질문.md §4.3, L76-L99] G ~ Gamma(L, L) → E[G]=1, Var[G]=1/L.
+    I' = I * G ⇒ |c'| = |c| * sqrt(G), angle(c') = angle(c).
+    """
+    if enl is None or enl <= 0:
+        return c
+    # Sample Gamma(L, L) with mean 1
+    # Use torch.distributions for correctness; determinism comes from global seed.
+    B = c.shape[0] if c.dim() == 4 else 1  # not used but kept for clarity
+    G = torch.distributions.Gamma(concentration=torch.tensor(enl, device=c.device),
+                                  rate=torch.tensor(enl, device=c.device)).sample(c.real.shape)
+    amp = torch.abs(c)
+    phase = torch.angle(c)
+    amp_s = amp * torch.sqrt(G.clamp_min(1e-12))
+    return amp_s * torch.exp(1j * phase)
+
+
+def _add_complex_thermal_noise(c: torch.Tensor, sigma: float) -> torch.Tensor:
+    """
+    Add circular complex Gaussian noise n ~ CN(0, σ^2).
+    [연구질문.md §4.3, L88-L99] Thermal noise floor option (constant σ).
+    Here σ is per real/imag component stdev for simplicity (ASSUMPTION).
+    """
+    if sigma is None or sigma <= 0:
+        return c
+    noise_r = torch.randn_like(c.real) * float(sigma)
+    noise_i = torch.randn_like(c.imag) * float(sigma)
+    return torch.complex(c.real + noise_r, c.imag + noise_i)
+
+
+def degrade_complex_lp(
+    hr_complex: torch.Tensor,
+    scale: int,
+    lp_params: LPParams,
+    device: torch.device,
+    *,
+    enl: float | None = None,
+    noise_std: float | None = None,
+) -> torch.Tensor:
+    """
+    Forward imaging model H followed by decimation D for SLC complex:
+    - Convolution with PSF (shared for real/imag) then stride decimation
+    - Optional multiplicative speckle (Gamma ENL) and additive thermal noise
+
+    hr_complex: Tensor [2,H,W] complex
     Returns: complex tensor [2, H/scale, W/scale]
+
+    Implements [연구질문.md §4.1, L49-L59] and [§4.3, L74-L99].
     """
     assert hr_complex.ndim == 3 and hr_complex.shape[0] == 2, f"Expected [2,H,W], got {hr_complex.shape}"
     if not torch.is_complex(hr_complex):
@@ -111,12 +171,17 @@ def degrade_complex_lp(hr_complex: torch.Tensor, scale: int, lp_params: LPParams
     if c.real.dtype not in (torch.float32, torch.float64):
         c = torch.complex(c.real.float(), c.imag.float())
     # Convolve real and imag with same PSF (depthwise over channels)
-    kernel = make_psf(lp_params.kind, lp_params.sigma_px, lp_params.size, lp_params.beta, device=device)
+    kernel = make_psf(lp_params.kind, lp_params.sigma_px, lp_params.size, lp_params.beta, device=device, cutoff=lp_params.cutoff)
     real = _conv2d_reflect(c.real.unsqueeze(0).float(), kernel, groups=c.shape[0]).squeeze(0)  # [2,H,W]
     imag = _conv2d_reflect(c.imag.unsqueeze(0).float(), kernel, groups=c.shape[0]).squeeze(0)  # [2,H,W]
     c_lp = torch.complex(real.float(), imag.float())  # [2,H,W]
     # Decimate by integer factor (spatial dims only)
     lr = c_lp[:, ::scale, ::scale]  # [2,H/scale,W/scale]
+    # Optional physically plausible degradations (phase-safe)
+    if enl is not None and enl > 0:
+        lr = _apply_multiplicative_speckle(lr, enl)
+    if noise_std is not None and noise_std > 0:
+        lr = _add_complex_thermal_noise(lr, noise_std)
     return lr
 
 
@@ -140,7 +205,7 @@ def degrade_mean_amp_phase(hr_complex: torch.Tensor, scale: int) -> torch.Tensor
     return lr
 
 
-def build_meta(lr_mode: str, scale: int, lp_params: LPParams | None) -> Dict:
+def build_meta(lr_mode: str, scale: int, lp_params: LPParams | None, enl: float | None = None, noise_std: float | None = None) -> Dict:
     meta = {
         'meta_version': 2,
         'lr_mode': lr_mode,
@@ -148,6 +213,12 @@ def build_meta(lr_mode: str, scale: int, lp_params: LPParams | None) -> Dict:
     }
     if lr_mode == 'complex_lp' and lp_params is not None:
         meta.update(lp_params.to_meta())
+    # Include noise metadata for cache-keying (deterministic reproducibility)
+    # [연구질문.md §4.3]
+    if enl is not None:
+        meta['enl'] = float(enl)
+    if noise_std is not None:
+        meta['noise_std'] = float(noise_std)
     return meta
 
 
@@ -156,7 +227,10 @@ def degrade_from_params(hr_np: np.ndarray,
                         hr_size: Tuple[int, int],
                         lr_mode: str,
                         lp_params: LPParams,
-                        device: torch.device = torch.device('cpu')) -> np.ndarray:
+                        device: torch.device = torch.device('cpu'),
+                        *,
+                        enl: float | None = None,
+                        noise_std: float | None = None) -> np.ndarray:
     """Entry point used by dataset. Returns np.complex64 (2,h,w)."""
     # Inputs are (2,H,W) complex64 np array
     hr_t = torch.from_numpy(hr_np).to(device)
@@ -169,7 +243,7 @@ def degrade_from_params(hr_np: np.ndarray,
     scale = scale_h
 
     if lr_mode == 'complex_lp':
-        lr_t = degrade_complex_lp(hr_t, scale, lp_params, device=device)
+        lr_t = degrade_complex_lp(hr_t, scale, lp_params, device=device, enl=enl, noise_std=noise_std)
     elif lr_mode == 'mean_amp_phase':
         lr_t = degrade_mean_amp_phase(hr_t, scale)
     else:

@@ -1,0 +1,9 @@
+{
+  "meta_version": 1,
+  "lr_mode": "complex_lp",
+  "scale": 4,
+  "kind": "sinc",
+  "sigma_px": 1.27,
+  "size": 13,
+  "beta": 8.0
+}

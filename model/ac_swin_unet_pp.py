@@ -11,6 +11,13 @@ Key points vs. prototype version:
 
 Input  : (B,4,H, W) real
 Output : (B,4,4H,4W) real (isotropic 4× upsampling in both height and width)
+
+Physical-consistency alignment (연구질문.md):
+- [§B] Phase-safe processing: all activations and attentions preserve complex phase
+  equivariance (e.g., `ComplexGELU` scales by a real function of |x|; attention
+  uses magnitude re-normalization only). Upsampling is performed per real/imag
+  with shared interpolation to avoid phase decorrelation. No magnitude-only
+  non-holomorphic operations are applied to the complex state.
 """
 from __future__ import annotations
 

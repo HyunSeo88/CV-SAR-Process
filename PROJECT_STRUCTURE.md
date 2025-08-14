@@ -21,20 +21,22 @@ Sentinel-1/                           # Root project directory
 │   └── validate.ipynb               # Data validation notebook
 │
 ├── model/                            # Core deep learning implementation
-│   ├── train.py                      # Main training script with TensorBoard integration
-│   ├── ac_swin_unet_pp.py           # AC-Swin-UNet++ model (primary architecture)
-│   ├── cv_unet.py                   # Complex U-Net baseline model
-│   ├── data_cache.py                # Data loading and caching utilities
-│   ├── utils.py                     # Training utilities and metrics
-│   ├── speed_utils.py               # Performance optimization utilities
+│   ├── train.py                      # Main training script with comprehensive CLI options
+│   ├── ac_swin_unet_pp.py           # AC-Swin-UNet++ model (primary architecture, 연구질문.md-aligned)
+│   ├── cv_unet.py                   # Complex U-Net baseline model (deprecated due to channel mismatch)
+│   ├── utils.py                     # Loss functions and evaluation metrics (연구질문.md-based)
+│   ├── degradations.py              # Physical HR→LR degradation models (PSF + noise simulation)
+│   ├── data_cache.py                # Metadata-driven LR patch caching system
+│   ├── speed_utils.py               # Performance optimization utilities (AMP, profiling)
 │   └── visualize_tensorboard.py     # TensorBoard analysis and export tools
 │
 ├── model_weights/                    # Saved model checkpoints
-│   ├── version1/                    # Initial Complex U-Net models
+│   ├── version1/                    # Initial Complex U-Net models (legacy)
 │   ├── version2/                    # AC-Swin-UNet++ baseline
 │   ├── version3_5000samples/        # Limited dataset experiments
 │   ├── version4_(checkboard_artifacts)/ # Models with checkerboard issues
-│   └── version5(여전한 아티팩트)/    # Latest attempts at artifact mitigation
+│   ├── version5(여전한 아티팩트)/    # Artifact mitigation attempts
+│   └── version6/                    # Latest with 연구질문.md refactoring (resize upsampling, complex SE fix)
 │
 ├── workflows/                        # Data processing and application scripts
 │   ├── patch_extractor_gpu_enhanced.py  # GPU-accelerated patch extraction
@@ -83,17 +85,17 @@ Sentinel-1/                           # Root project directory
 
 ## Key Architecture Components
 
-### Model Architecture
+### Model Architecture (연구질문.md-Aligned)
 - **Primary Model**: AC-Swin-UNet++ (`ac_swin_unet_pp.py`)
-  - Complex-valued convolutions for SAR phase preservation
-  - Swin Transformer blocks with shifted windows
-  - Dense skip connections (U-Net++ architecture)
-  - Complex SE attention + spatial attention mechanisms
-  - Complex PixelShuffle for artifact-reduced upsampling
+  - **Phase-Safe Operations**: All complex layers preserve phase equivariance
+  - Swin Transformer blocks with shifted windows (8×4) and magnitude-renormalized attention
+  - Dense skip connections (U-Net++) with residual scaling (0.3×output + 0.7×residual)
+  - Complex SE attention (with zero-channel fix) + spatial attention mechanisms
+  - **Resize-Based Upsampling**: Bilinear interpolation + convolution to eliminate artifacts
 
-- **Baseline Model**: Complex U-Net (`cv_unet.py`)
-  - Traditional encoder-decoder with complex operations
-  - VH attention mechanism for cross-polarization guidance
+- **Baseline Model**: Complex U-Net (`cv_unet.py`) - **DEPRECATED**
+  - Channel mismatch: expects 3 channels, receives 4 from current dataset
+  - Legacy encoder-decoder with complex operations (no longer supported)
 
 ### Data Pipeline
 - **Input Format**: Complex64 dual-pol SAR patches (2, H, W) → VV+VH polarizations
@@ -101,17 +103,19 @@ Sentinel-1/                           # Root project directory
 - **Resolution**: HR patches (512×256) → LR patches (128×64) for 4× super-resolution
 - **Quality Control**: Cross-polarization coherence filtering and zero-value removal
 
-### Training Infrastructure
-- **Loss Function**: Hybrid amplitude MSE + phase L1 + optional perceptual loss
-- **Optimization**: Mixed precision training with early stopping
-- **Monitoring**: Comprehensive TensorBoard logging with SAR-specific metrics
-- **Performance**: Dual-pol PSNR/SSIM evaluation for VV and VH channels
+### Training Infrastructure (연구질문.md Implementation)
+- **Physical Loss Framework**: Magnitude, phase, coherence, spectral, and data consistency losses
+- **Degradation System**: Realistic PSF + noise simulation replacing naive block averaging
+- **Optimization**: bfloat16 mixed precision with early stopping and auto-adjustment
+- **Monitoring**: Comprehensive TensorBoard logging with phase/amplitude artifact detection
+- **Performance**: Dual-pol PSNR/SSIM evaluation + SAR-specific metrics (CPIF, phase RMSE)
 
-### Current Status
-- **Active Issue**: Checkerboard artifacts in super-resolution outputs
-- **Mitigation Efforts**: Multiple training iterations with modified loss functions and architectures
-- **Data Scale**: Working with filtered high-quality patch dataset
-- **Model Versions**: Progressive improvements through 5 major model iterations
+### Current Status (Research-Driven)
+- **Research Integration**: Complete 연구질문.md-based refactoring addressing phase processing stability
+- **Architecture Improvements**: Complex SE fix, resize upsampling, residual scaling optimization
+- **Physical Degradation**: Realistic PSF convolution + noise simulation implemented
+- **Performance Optimization**: AMP, metadata caching, profiling integration for faster training
+- **Model Evolution**: Version 6 with comprehensive artifact mitigation and physical consistency
 
 ## File Naming Conventions
 

@@ -11,6 +11,7 @@ Complete training pipeline for dual-pol SAR super-resolution:
 
 Designed for Korean disaster monitoring applications.
 """
+from __future__ import annotations
 
 import os
 import shutil  # For rebuilding LR cache
@@ -19,6 +20,7 @@ import time
 import pickle
 from pathlib import Path
 from typing import Tuple, Optional
+import random
 import datetime
 from contextlib import nullcontext  # PERF: for optional context
 # PERF: Import argparse for CLI flags
@@ -62,7 +64,8 @@ class SARSuperResDataset(Dataset):
     
     def __init__(self, file_list: list, data_dir: str, lr_size: Tuple[int, int] = (128, 64),
                  hr_size: Tuple[int, int] = (512, 256), *, use_cache: bool = True, gpu_degrade: bool = False,
-                 lr_mode: str = 'complex_lp', lp_kind: str = 'gaussian', lp_sigma: float = 1.2, lp_size: int = 9, lp_beta: float = 12.0):
+                 lr_mode: str = 'complex_lp', lp_kind: str = 'gaussian', lp_sigma: float = 1.2, lp_size: int = 9, lp_beta: float = 12.0, lp_cutoff: float | None = None,
+                 enl: float | None = None, noise_std: float | None = None, split: str = 'train'):
 
         """
         Initialize SAR dataset
@@ -80,7 +83,11 @@ class SARSuperResDataset(Dataset):
         self.use_cache = use_cache
         self.gpu_degrade = gpu_degrade
         self.lr_mode = lr_mode
-        self.lp_params = LPParams(kind=lp_kind, sigma_px=lp_sigma, size=lp_size, beta=lp_beta)
+        self.lp_params = LPParams(kind=lp_kind, sigma_px=lp_sigma, size=lp_size, beta=lp_beta, cutoff=lp_cutoff)
+        # Physical degradations (연구질문.md §4.3)
+        self.enl = enl
+        self.noise_std = noise_std
+        self.split = split
         
         print(f"Initialized dataset with {len(self.hr_files)} SAR patches.")
         
@@ -91,7 +98,8 @@ class SARSuperResDataset(Dataset):
     
     def _create_synthetic_data(self):
         """Create synthetic data for testing when no real data is available"""
-        n_samples = 1000 if self.split == 'train' else 100
+        # Small synthetic set for quick tests and --tiny runs
+        n_samples = 32 if self.split == 'train' else 8
         
         self.synthetic_data = []
         for i in range(n_samples):
@@ -102,7 +110,7 @@ class SARSuperResDataset(Dataset):
             
             self.synthetic_data.append(hr_data)
         
-        self.hr_files = [f"synthetic_{i}.npy" for i in range(n_samples)]
+        self.hr_files = [f"synthetic_{self.split}_{i}.npy" for i in range(n_samples)]
     
     def _simulate_lr_from_hr(self, hr_data: np.ndarray) -> np.ndarray:
         """Resolution-scaled SAR degradation according to selected lr_mode."""
@@ -130,7 +138,8 @@ class SARSuperResDataset(Dataset):
         with autocast(device_type='cuda', enabled=False):
             if self.lr_mode == 'complex_lp':
                 from degradations import degrade_complex_lp
-                lr_c = degrade_complex_lp(hr_c, H // h, self.lp_params, device)
+                # Apply optional multiplicative speckle and thermal noise per §4.3
+                lr_c = degrade_complex_lp(hr_c, H // h, self.lp_params, device, enl=self.enl, noise_std=self.noise_std)
             else:
                 from degradations import degrade_mean_amp_phase
                 lr_c = degrade_mean_amp_phase(hr_c, H // h)
@@ -173,7 +182,8 @@ class SARSuperResDataset(Dataset):
         if not hasattr(self, 'synthetic_data') and self.use_cache:
             # Add meta so that cache is reused only when parameters match
             scale = self.hr_size[0] // self.lr_size[0]
-            meta = build_meta(self.lr_mode, scale, self.lp_params)
+            # Include noise metadata for reproducible caching (§4.3)
+            meta = build_meta(self.lr_mode, scale, self.lp_params, enl=self.enl, noise_std=self.noise_std)
             lr_data = load_or_compute_lr(Path(hr_file), self._simulate_lr_from_hr, hr_data, meta=meta)
         else:
             lr_data = self._simulate_lr_from_hr(hr_data)
@@ -219,7 +229,8 @@ class EarlyStopping:
 
 
 def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0, *, use_cache: bool = True, gpu_degrade: bool = False, max_samples: int = None,
-                       lr_mode: str = 'complex_lp', lp_kind: str = 'gaussian', lp_sigma: float = 1.2, lp_size: int = 9, lp_beta: float = 12.0):
+                       lr_mode: str = 'complex_lp', lp_kind: str = 'gaussian', lp_sigma: float = 1.2, lp_size: int = 9, lp_beta: float = 12.0, lp_cutoff: float | None = None,
+                       sr_scale: int = 4, enl: float | None = None, noise_std: float | None = None, tiny: bool = False):
     """
     Create train and validation dataloaders
     
@@ -239,7 +250,7 @@ def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0
     if max_samples is not None:
         cache_path = Path(data_dir) / f'file_split_cache_{max_samples}.pkl'
     
-    if use_cache and cache_path.exists():
+    if use_cache and cache_path.exists() and not tiny:
         with open(cache_path, 'rb') as f:
             file_splits = pickle.load(f)
         print(f"Loaded file splits from cache: {cache_path}")
@@ -247,7 +258,7 @@ def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0
             print(f"Using subset of {max_samples} samples")
     else:
         print("Scanning for all .npy files and creating new train/val/test splits...")
-        all_files = list(Path(data_dir).rglob(pattern))
+        all_files = [] if tiny else list(Path(data_dir).rglob(pattern))
         # 1) Filter out cached/low-res or generated directories that should not be treated as HR
         def is_valid_hr_path(p: Path) -> bool:
             blocklist = {"lr_cache", "LR", "SR"}
@@ -300,11 +311,19 @@ def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0
             pickle.dump(file_splits, f)
         print(f"Saved new file splits to cache: {cache_path}")
 
+    # Compute LR/HR sizes from sr_scale (HR default 512x256)
+    hr_size = (512, 256)
+    lr_size = (hr_size[0] // sr_scale, hr_size[1] // sr_scale)
+
     # Create datasets with pre-split file lists
-    train_dataset = SARSuperResDataset(file_splits['train'], data_dir, use_cache=use_cache, gpu_degrade=gpu_degrade,
-                                       lr_mode=lr_mode, lp_kind=lp_kind, lp_sigma=lp_sigma, lp_size=lp_size, lp_beta=lp_beta)
-    val_dataset = SARSuperResDataset(file_splits['val'], data_dir, use_cache=use_cache, gpu_degrade=gpu_degrade,
-                                     lr_mode=lr_mode, lp_kind=lp_kind, lp_sigma=lp_sigma, lp_size=lp_size, lp_beta=lp_beta)
+    train_dataset = SARSuperResDataset(file_splits['train'], data_dir, lr_size=lr_size, hr_size=hr_size,
+                                       use_cache=use_cache, gpu_degrade=gpu_degrade,
+                                       lr_mode=lr_mode, lp_kind=lp_kind, lp_sigma=lp_sigma, lp_size=lp_size, lp_beta=lp_beta, lp_cutoff=lp_cutoff,
+                                       enl=enl, noise_std=noise_std, split='train')
+    val_dataset = SARSuperResDataset(file_splits['val'], data_dir, lr_size=lr_size, hr_size=hr_size,
+                                     use_cache=use_cache, gpu_degrade=gpu_degrade,
+                                     lr_mode=lr_mode, lp_kind=lp_kind, lp_sigma=lp_sigma, lp_size=lp_size, lp_beta=lp_beta, lp_cutoff=lp_cutoff,
+                                     enl=enl, noise_std=noise_std, split='val')
     
     # PERF: Optimized DataLoader settings - pin_memory=False for better stability
     train_loader = DataLoader(
@@ -329,8 +348,10 @@ def create_dataloaders(data_dir: str, batch_size: int = 16, num_workers: int = 0
 
 
 def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual, scaler, profiler=None, *, perceptual_weight: float = 0.0, fft_weight: float = 0.0, amp_enabled: bool = True, amp_dtype=torch.bfloat16,
-                phase_coh_weight_on: bool = True, phase_coh_p: float = 1.0, phase_window: int = 7,
-                peak_boost_on: bool = True, peak_topk: float = 95.0, peak_weight: float = 0.05):
+                # Physical loss weights (연구질문.md)
+                w_mag: float = 1.0, w_phase: float = 1.0, w_coh: float = 0.0, w_spec: float = 0.0, w_dc: float = 0.0,
+                phase_window: int = 7, spec_cutoff: float = 0.45,
+                dc_scale: int | None = None, dc_lp_params: LPParams | None = None):
     """
     Train for one epoch
     
@@ -367,17 +388,16 @@ def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual
                 pred_hr = pred_hr[..., :h, :w]
                 hr_batch = hr_batch[..., :h, :w]
             
-            # Calculate loss
+            # Calculate loss (연구질문.md §4.1, §4.2, §C)
             loss_components = sr_loss(
                 pred_hr.float(), hr_batch, perceptual,
+                w_mag=w_mag, w_phase=w_phase, w_coh=w_coh, w_spec=w_spec,
+                w_dc=w_dc, lr_input=lr_batch if w_dc>0 else None,
+                dc_scale=dc_scale, dc_lp_params=dc_lp_params,
+                spec_cutoff_rng=spec_cutoff, spec_cutoff_az=spec_cutoff,
                 perceptual_weight=perceptual_weight,
                 fft_weight=fft_weight,
-                phase_coh_weight_on=phase_coh_weight_on,
-                phase_coh_p=phase_coh_p,
                 phase_window=phase_window,
-                peak_boost_on=peak_boost_on,
-                peak_topk=peak_topk,
-                peak_weight=peak_weight,
             )
             
             # Handle both dict (new) and tuple (old) formats
@@ -415,8 +435,10 @@ def train_epoch(model, train_loader, optimizer, device, metrics_calc, perceptual
 
 
 def validate_epoch(model, val_loader, device, metrics_calc, perceptual, *, perceptual_weight: float = 0.0, fft_weight: float = 0.0, amp_enabled: bool = True, amp_dtype=torch.bfloat16,
-                   phase_coh_weight_on: bool = True, phase_coh_p: float = 1.0, phase_window: int = 7,
-                   peak_boost_on: bool = True, peak_topk: float = 95.0, peak_weight: float = 0.05):
+                   # Physical loss weights
+                   w_mag: float = 1.0, w_phase: float = 1.0, w_coh: float = 0.0, w_spec: float = 0.0, w_dc: float = 0.0,
+                   phase_window: int = 7, spec_cutoff: float = 0.45,
+                   dc_scale: int | None = None, dc_lp_params: LPParams | None = None):
     """
     Validate for one epoch
     
@@ -456,14 +478,13 @@ def validate_epoch(model, val_loader, device, metrics_calc, perceptual, *, perce
                 # Calculate loss
                 loss_components = sr_loss(
                     pred_hr.float(), hr_batch, perceptual,
+                    w_mag=w_mag, w_phase=w_phase, w_coh=w_coh, w_spec=w_spec,
+                    w_dc=w_dc, lr_input=lr_batch if w_dc>0 else None,
+                    dc_scale=dc_scale, dc_lp_params=dc_lp_params,
+                    spec_cutoff_rng=spec_cutoff, spec_cutoff_az=spec_cutoff,
                     perceptual_weight=perceptual_weight,
                     fft_weight=fft_weight,
-                    phase_coh_weight_on=phase_coh_weight_on,
-                    phase_coh_p=phase_coh_p,
                     phase_window=phase_window,
-                    peak_boost_on=peak_boost_on,
-                    peak_topk=peak_topk,
-                    peak_weight=peak_weight,
                 )
                 
                 # Handle both dict (new) and tuple (old) formats
@@ -660,19 +681,25 @@ def train_model(
     lp_sigma: float = 1.2,
     lp_size: int = 9,
     lp_beta: float = 12.0,
-    # Phase/peak loss parameters
-    phase_coh_weight: str = 'on',
-    phase_coh_p: float = 1.0,
+    lp_cutoff: float | None = None,
+    sr_scale: int = 4,
+    enl: float | None = None,
+    noise_std: float | None = None,
+    # Physical loss weights (연구질문.md)
+    w_mag: float = 1.0,
+    w_phase: float = 1.0,
+    w_coh: float = 0.0,
+    w_spec: float = 0.0,
+    w_dc: float = 0.0,
+    spec_cutoff: float = 0.45,
     phase_window: int = 7,
-    peak_boost: str = 'on',
-    peak_topk: float = 95.0,
-    peak_weight: float = 0.05,
     # Model architecture parameters
     norm: str = 'gn',
     norm_groups: int = 8,
     attn_mag_renorm: str = 'on',
     attn_temp: float = 1.0,
     eval_window: int = 7,
+    tiny: bool = False,
 ):
     """
     Main training function with TensorBoard logging
@@ -708,6 +735,16 @@ def train_model(
     else:
         print("AMP disabled")
     
+    # Deterministic training (연구질문.md E) – set seeds and cudnn deterministic
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     # Setup TensorBoard logging
     writer = None
     if enable_tensorboard:
@@ -767,6 +804,11 @@ def train_model(
         lp_sigma=lp_sigma,
         lp_size=lp_size,
         lp_beta=lp_beta,
+        lp_cutoff=lp_cutoff,
+        sr_scale=sr_scale,
+        enl=enl,
+        noise_std=noise_std,
+        tiny=tiny,
     )
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     
@@ -859,12 +901,9 @@ def train_model(
                 model, train_loader, optimizer, device, train_metrics, perceptual, scaler, profiler,
                 perceptual_weight=perceptual_weight, fft_weight=fft_weight,
                 amp_enabled=amp_enabled, amp_dtype=amp_dtype,
-                phase_coh_weight_on=(phase_coh_weight=='on'),
-                phase_coh_p=phase_coh_p,
-                phase_window=phase_window,
-                peak_boost_on=(peak_boost=='on'),
-                peak_topk=peak_topk,
-                peak_weight=peak_weight,
+                w_mag=w_mag, w_phase=w_phase, w_coh=w_coh, w_spec=w_spec, w_dc=w_dc,
+                phase_window=phase_window, spec_cutoff=spec_cutoff,
+                dc_scale=sr_scale, dc_lp_params=LPParams(kind=lp_kind, sigma_px=lp_sigma, size=lp_size, beta=lp_beta, cutoff=lp_cutoff),
             )
             train_avg_metrics = train_metrics.get_average_metrics()
             
@@ -874,12 +913,9 @@ def train_model(
                 model, val_loader, device, val_metrics, perceptual,
                 perceptual_weight=perceptual_weight, fft_weight=fft_weight,
                 amp_enabled=amp_enabled, amp_dtype=amp_dtype,
-                phase_coh_weight_on=(phase_coh_weight=='on'),
-                phase_coh_p=phase_coh_p,
-                phase_window=phase_window,
-                peak_boost_on=(peak_boost=='on'),
-                peak_topk=peak_topk,
-                peak_weight=peak_weight,
+                w_mag=w_mag, w_phase=w_phase, w_coh=w_coh, w_spec=w_spec, w_dc=w_dc,
+                phase_window=phase_window, spec_cutoff=spec_cutoff,
+                dc_scale=sr_scale, dc_lp_params=LPParams(kind=lp_kind, sigma_px=lp_sigma, size=lp_size, beta=lp_beta, cutoff=lp_cutoff),
             )
             val_avg_metrics = val_metrics.get_average_metrics()
             
@@ -919,15 +955,16 @@ def train_model(
                 writer.add_scalar('PhaseMetrics/Val_PhaseFFT', val_avg_metrics.get('phase_fft_loss', 0), epoch)
 
                 # Log loss components (Train/Val) and weights
-                for k in ['log_amp_loss','phase_loss','complex_l1','fft_loss','phase_fft_loss','tv_loss','perceptual_loss','phase_coh_loss','peak_loss']:
+                for k in ['mag_loss','phase_loss','coh_loss','spec_loss','dc_loss','fft_loss','phase_fft_loss','tv_loss','perceptual_loss']:
                     if k in train_avg_metrics:
                         writer.add_scalar(f'LossComponents/Train_{k}', train_avg_metrics[k], epoch)
                     if k in val_avg_metrics:
                         writer.add_scalar(f'LossComponents/Val_{k}', val_avg_metrics[k], epoch)
-                writer.add_scalar('LossWeights/fft_weight', fft_weight, epoch)
-                writer.add_scalar('LossWeights/perceptual_weight', perceptual_weight, epoch)
-                writer.add_scalar('LossWeights/peak_weight', peak_weight, epoch)
-                writer.add_scalar('LossWeights/phase_coh_p', phase_coh_p, epoch)
+                writer.add_scalar('LossWeights/w_mag', w_mag, epoch)
+                writer.add_scalar('LossWeights/w_phase', w_phase, epoch)
+                writer.add_scalar('LossWeights/w_coh', w_coh, epoch)
+                writer.add_scalar('LossWeights/w_spec', w_spec, epoch)
+                writer.add_scalar('LossWeights/w_dc', w_dc, epoch)
                 
                 # Log images
                 if epoch % 5 == 0 or epoch == num_epochs - 1: # Log every 5 epochs or at the end
@@ -961,6 +998,19 @@ def train_model(
                     log_images_to_tensorboard(writer, lr_batch_sample, hr_batch_sample, pred_hr_sample, epoch, num_images=1)
                     log_complex_statistics(writer, hr_batch_sample, 'HR_Target', epoch)
                     log_complex_statistics(writer, pred_hr_sample, 'SR_Prediction', epoch)
+
+                    # Log spectra snapshots (연구질문.md §4.2)
+                    def to_spectrum_img(c4):
+                        c_vv = torch.complex(c4[:,0], c4[:,1])
+                        U = torch.fft.fftshift(torch.fft.fft2(c_vv))
+                        spec = torch.log(torch.abs(U) + 1e-6)
+                        spec = (spec - spec.min()) / (spec.max() - spec.min() + 1e-8)
+                        return spec.unsqueeze(1)
+                    try:
+                        writer.add_images('Spectra/HR_VV', to_spectrum_img(hr_batch_sample), epoch)
+                        writer.add_images('Spectra/SR_VV', to_spectrum_img(pred_hr_sample), epoch)
+                    except Exception:
+                        pass
                     
                     # Monitor coherence improvement for dual-pol data
                     # if hr_batch_sample.shape[1] == 2: # Removed coherence logging
@@ -1145,6 +1195,12 @@ if __name__ == "__main__":
     parser.add_argument('--lp-sigma', type=float, default=1.2, help='PSF sigma in pixels')
     parser.add_argument('--lp-size', type=int, default=9, help='PSF kernel size (odd)')
     parser.add_argument('--lp-beta', type=float, default=12.0, help='Kaiser beta (sinc only)')
+    parser.add_argument('--lp-cutoff', type=float, default=None, help='Normalized cutoff (0..0.5) for sinc PSF; overrides sigma mapping')
+    parser.add_argument('--cutoff', type=float, default=None, help='Alias of --lp-cutoff')
+    # Physical LR synthesis controls (연구질문.md §4.3)
+    parser.add_argument('--sr-scale', type=int, default=4, help='Super-resolution scale factor (integer)')
+    parser.add_argument('--enl', type=float, default=None, help='ENL for multiplicative speckle (Gamma(L,L)) on LR synthesis')
+    parser.add_argument('--noise-std', type=float, default=None, help='Thermal noise std for circular complex Gaussian on LR synthesis')
     # Phase/peak losses
     parser.add_argument('--phase-coh-weight', choices=['on','off'], default='on', help='Enable coherence-weighted phase loss')
     parser.add_argument('--phase-coh-p', type=float, default=1.0, help='Exponent p for coherence weighting')
@@ -1166,6 +1222,18 @@ if __name__ == "__main__":
     parser.add_argument('--psnr-ref', choices=['fixed', 'per_dataset'], default='fixed', help='PSNR reference: fixed constants or per-dataset max values')
     parser.add_argument('--amp', choices=['off', 'fp16', 'bf16'], default='bf16', help='AMP precision: off, fp16, or bf16 (default: bf16)')
     parser.add_argument('--num-epochs', type=int, default=None, help='Override default number of training epochs (e.g., 1 for quick dry-run)')
+    # Physical loss weights (연구질문.md §8, §C)
+    parser.add_argument('--w-mag', type=float, default=1.0, help='Weight for magnitude loss (log-amplitude L1)')
+    parser.add_argument('--w-phase', type=float, default=1.0, help='Weight for circular phase loss')
+    parser.add_argument('--w-coh', type=float, default=0.0, help='Weight for coherence loss (1 - |γ|)')
+    parser.add_argument('--w-spec', type=float, default=0.0, help='Weight for spectral band loss')
+    parser.add_argument('--w-dc', type=float, default=0.0, help='Weight for data-consistency loss')
+    parser.add_argument('--spec-cutoff', type=float, default=0.45, help='Elliptical spectral mask cutoff fraction (range/azimuth)')
+    # Tiny dataset runner
+    parser.add_argument('--tiny', action='store_true', help='Use tiny synthetic dataset for quick smoke runs')
+    # Aliases for kernel options (A)
+    parser.add_argument('--kernel', choices=['gaussian','sinc'], default=None, help='Alias of --lp-kind')
+    parser.add_argument('--kernel-size', type=int, default=None, help='Alias of --lp-size')
     args = parser.parse_args()
 
     # Set multiprocessing start method to avoid CUDA init deadlocks
@@ -1189,6 +1257,13 @@ if __name__ == "__main__":
     globals()['create_model'] = create_model_fn
 
     # Configuration
+    # Apply alias mappings
+    if args.kernel is not None:
+        args.lp_kind = args.kernel
+    if args.kernel_size is not None:
+        args.lp_size = args.kernel_size
+    if args.cutoff is not None:
+        args.lp_cutoff = args.cutoff
     config = {
         'data_dir': r"D:\Sentinel-1\data\patches\zero_filtered",
         'model_save_path': r"D:\Sentinel-1\model\acswin_unet_pp.pth",
@@ -1216,13 +1291,18 @@ if __name__ == "__main__":
         'lp_sigma': args.lp_sigma,
         'lp_size': args.lp_size,
         'lp_beta': args.lp_beta,
-        # Loss toggles
-        'phase_coh_weight': args.phase_coh_weight,
-        'phase_coh_p': args.phase_coh_p,
+        'lp_cutoff': args.lp_cutoff,
+        'sr_scale': args.sr_scale,
+        'enl': args.enl,
+        'noise_std': args.noise_std,
+        # Physical losses (map to utils.sr_loss)
+        'w_mag': args.w_mag,
+        'w_phase': args.w_phase,
+        'w_coh': args.w_coh,
+        'w_spec': args.w_spec,
+        'w_dc': args.w_dc,
+        'spec_cutoff': args.spec_cutoff,
         'phase_window': args.phase_window,
-        'peak_boost': args.peak_boost,
-        'peak_topk': args.peak_topk,
-        'peak_weight': args.peak_weight,
         # Norm/Attention
         'norm': args.norm,
         'norm_groups': args.norm_groups,
@@ -1230,6 +1310,8 @@ if __name__ == "__main__":
         'attn_temp': args.attn_temp,
         # Eval
         'eval_window': args.eval_window,
+        # Tiny
+        'tiny': args.tiny,
     }
 
     # Optional override of num_epochs from CLI for quick tests

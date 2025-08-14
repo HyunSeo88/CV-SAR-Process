@@ -1,9 +1,10 @@
 {
-  "meta_version": 1,
+  "meta_version": 2,
   "lr_mode": "complex_lp",
   "scale": 4,
   "kind": "gaussian",
-  "sigma_px": 1.0,
+  "sigma_px": 1.2,
   "size": 9,
-  "beta": 12.0
+  "beta": 12.0,
+  "cutoff": null
 }

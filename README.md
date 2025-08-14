@@ -8,22 +8,23 @@ This project implements state-of-the-art deep learning models to enhance the spa
 
 ### Key Features
 
-- **Dual-Polarimetric Processing**: Full support for VV+VH polarization channels
-- **Phase-Preserving Architecture**: Complex-valued neural networks maintaining SAR coherence
-- **Advanced Model Architecture**: AC-Swin-UNet++ with shifted-window Swin Transformers
-- **GPU-Accelerated Pipeline**: CUDA-optimized training and inference
-- **Comprehensive Evaluation**: SAR-specific metrics including CPIF, cross-pol coherence, and phase RMSE
+- **Dual-Polarimetric Processing**: Full support for VV+VH polarization channels with phase preservation
+- **Physical Degradation Models**: Research-driven HR→LR synthesis with realistic PSF and noise simulation
+- **Advanced Model Architecture**: AC-Swin-UNet++ with phase-safe complex operations and artifact mitigation
+- **Physical Loss Framework**: Comprehensive loss system including magnitude, phase, coherence, and spectral constraints
+- **GPU-Accelerated Pipeline**: CUDA-optimized training with mixed precision and performance profiling
+- **Research Integration**: Direct implementation of 연구질문.md research objectives and constraints
 
 ## 🏗️ Architecture
 
-### Primary Model: AC-Swin-UNet++
-Our main super-resolution model combines several cutting-edge techniques:
+### Primary Model: AC-Swin-UNet++ (연구질문.md-Aligned)
+Our main super-resolution model addresses key research questions with advanced techniques:
 
-- **Complex-Valued Convolutions**: Preserves both amplitude and phase information
-- **Swin Transformer Blocks**: Captures long-range dependencies with shifted windows (8×4 configuration)
-- **Dense Skip Connections**: U-Net++ architecture for multi-scale feature fusion
-- **Attention Mechanisms**: Complex SE attention + spatial attention for enhanced feature selection
-- **Complex PixelShuffle**: Learnable upsampling that mitigates checkerboard artifacts
+- **Phase-Safe Complex Operations**: All layers preserve complex phase equivariance (연구질문.md §B)
+- **Swin Transformer Blocks**: Long-range dependencies with shifted windows (8×4) and magnitude-renormalized attention
+- **Dense Skip Connections**: U-Net++ architecture for multi-scale feature fusion with residual scaling (0.3×output + 0.7×residual)
+- **Attention Mechanisms**: Complex SE attention (with zero-channel fix) + spatial attention
+- **Resize-Based Upsampling**: Bilinear interpolation + convolution to eliminate checkerboard artifacts
 
 ```python
 Input:  (Batch, 4, H, W)     # [VV-Real, VV-Imag, VH-Real, VH-Imag]
@@ -44,10 +45,14 @@ Output: (Batch, 4, 4H, 4W)   # 4× super-resolved SAR imagery
    - Statistical analysis with amplitude/phase distribution plots
    - Output to quality-filtered dataset: `data/patches/zero_filtered/`
 
-3. **Training Data Preparation**:
-   - 512×256 HR patches from filtered dataset
-   - Synthetic 128×64 LR patches via realistic degradation
-   - GPU-accelerated caching and augmentation during training
+3. **Physical Degradation System** (`model/degradations.py`):
+   - **Research-Driven LR Synthesis**: Addresses 연구질문.md question 1 (HR→LR 열화 모델)
+   - **Forward Operator H**: Gaussian/Sinc PSF convolution with reflect padding
+   - **Decimation D**: Integer-scale spatial subsampling after anti-aliasing
+   - **Physical Noise Simulation** (연구질문.md §4.3):
+     - Multiplicative speckle: Gamma(L,L) with adjustable ENL
+     - Thermal noise: Complex Gaussian with configurable noise floor
+   - **Metadata-Driven Caching**: Ensures parameter consistency across training runs
 
 ## 📊 Current Performance
 
@@ -69,39 +74,44 @@ Output: (Batch, 4, 4H, 4W)   # 4× super-resolved SAR imagery
 - [x] Comprehensive evaluation framework with disaster monitoring metrics
 - [x] GPU-accelerated patch extraction and caching system
 
-### 🔄 Active Development: Checkerboard Artifact Mitigation
+### 🔄 Active Research: Phase Processing Stability (연구질문.md §3)
 
-**Issue**: Recent training iterations have shown checkerboard artifacts in super-resolution outputs, particularly affecting high-frequency details.
+**Research Question**: "Complex network 위상 정보의 학습 불안정성을 어떻게 처리할 것인지?"
 
-**Mitigation Efforts** (Versions 4-5):
-- Modified upsampling strategy using Complex PixelShuffle
-- Adjusted loss function weighting between amplitude and phase components
-- Experimented with different training regularization techniques
-- Enhanced data augmentation to improve model robustness
+**Major Refactoring Completed**:
+- **Physical Loss Framework**: Magnitude, phase, coherence, spectral, and data consistency losses
+- **Architecture Improvements**: Complex SE fix, resize upsampling, residual scaling optimization
+- **Degradation Models**: Realistic PSF + noise simulation replacing simplistic averaging
+- **Performance Optimization**: bfloat16 AMP, metadata caching, profiling integration
 
-**Recent Commits**:
-- `1258390`: Latest checkerboard artifact mitigation attempts
-- `8f6964f`: Improved TensorBoard visualization for artifact analysis
-- `8d6699c`: Loss function modifications and visualization enhancements
+**Current Solutions** (Version 6):
+- Phase-safe complex operations throughout the network
+- Balanced residual connections (0.3×output + 0.7×residual) for stability
+- Magnitude-renormalized attention for complex-valued features
+- Comprehensive physical loss system addressing all research objectives
 
-### 🎯 Next Steps
-- [ ] Resolve checkerboard artifacts through architectural refinements
-- [ ] Implement progressive training strategy for artifact reduction
-- [ ] Expand dataset with additional Korean Peninsula coverage
-- [ ] Deploy real-time inference pipeline for operational use
+### 🎯 Research Roadmap (연구질문.md-Driven)
+- [ ] **Conditional SR**: Investigate DEM/LC conditioning for disaster-specific applications
+- [ ] **Alternative Activations**: Experiment with ComplexLeakyReLU vs ComplexGELU for phase preservation
+- [ ] **Disaster Task Specialization**: Focus on landslide vs ground subsidence applications
+- [ ] **Data Consistency**: Implement forward model constraints for self-supervised training
+- [ ] **Korean Dataset Expansion**: Additional coverage for diverse terrain and disaster scenarios
 
 ## 🛠️ Quick Start
 
 ### Training a Model
 ```bash
-# Basic training with default AC-Swin-UNet++ model
-python model/train.py
+# Basic training with physical degradation (연구질문.md compliant)
+python model/train.py --lr-mode complex_lp --lp-kind gaussian --lp-sigma 1.2 --enl 10.0 --noise-std 0.01
 
-# Training with TensorBoard monitoring
-python model/train.py --batch-size-auto --auto-workers
+# Physical loss framework training
+python model/train.py --w-mag 1.0 --w-phase 1.0 --w-coh 0.1 --w-spec 0.05 --w-dc 0.1
 
-# Limited sample training for testing
-python model/train.py --max-samples 1000 --no-perceptual
+# Performance-optimized training with auto-adjustment
+python model/train.py --batch-size-auto --auto-workers --amp bf16
+
+# Development: quick validation with synthetic data
+python model/train.py --tiny --num-epochs 1 --dry-run
 ```
 
 ### Monitoring Training Progress
@@ -115,11 +125,11 @@ python model/visualize_tensorboard.py --export-plots
 
 ### Applying Super-Resolution
 ```bash
-# Process single patch
-python workflows/SR_apply.py --input patch.npy --output sr_patch.npy --model model_weights/version5/acswin_unet_pp.pth
+# Process single patch with latest model
+python workflows/SR_apply.py --input patch.npy --output sr_patch.npy --model model_weights/version6/acswin_unet_pp.pth
 
-# Batch processing
-python workflows/SR_apply.py --input-dir data/patches/LR --output-dir results/SR --model model_weights/version5/acswin_unet_pp.pth
+# Batch processing with optimized model
+python workflows/SR_apply.py --input-dir data/patches/LR --output-dir results/SR --model model_weights/version6/acswin_unet_pp.pth
 ```
 
 ## 📁 Project Structure
@@ -140,7 +150,12 @@ See [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) for detailed directory organiza
 - **Hardware**: CUDA-enabled GPU with 8-12GB memory
 - **Batch Size**: 32 (auto-adjustable based on GPU memory)
 - **Learning Rate**: 1e-4 with cosine annealing schedule
-- **Loss Function**: Hybrid amplitude MSE + phase L1 + optional perceptual loss
+- **Loss Function (A-constraints)**: sum of
+  - Data Consistency: ||Down_H(û) − y||₁ (optional)
+  - Magnitude: L1(log|S_SR|, log|S_HR|)
+  - Phase: circular MAE after global phase align
+  - Coherence: 1 - |γ| (local window)
+  - Spectral band: ∥(1−M)⊙F{û}∥² with elliptical mask M
 - **Early Stopping**: 10 epochs patience with best weight restoration
 
 ### Model Variants
