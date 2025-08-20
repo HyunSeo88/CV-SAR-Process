@@ -1,3 +1,5 @@
 *.npy filter=lfs diff=lfs merge=lfs -text
 *.png filter=lfs diff=lfs merge=lfs -text
 *.pt filter=lfs diff=lfs merge=lfs -text
+# Jupyter 노트북을 Python으로 분류하되 통계 가중치 조정
+*.ipynb linguist-language=Python linguist-documentation
