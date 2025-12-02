@@ -15,7 +15,7 @@ This project implements state-of-the-art deep learning models to enhance the spa
 - **GPU-Accelerated Pipeline**: CUDA-optimized training with mixed precision and performance profiling
 - **Research Integration**: Direct implementation of 연구질문.md research objectives and constraints
 
-## 🏗️ Architecture
+##  Architecture
 
 ### Primary Model: AC-Swin-UNet++ (연구질문.md-Aligned)
 Our main super-resolution model addresses key research questions with advanced techniques:
@@ -54,7 +54,7 @@ Output: (Batch, 4, 4H, 4W)   # 4× super-resolved SAR imagery
      - Thermal noise: Complex Gaussian with configurable noise floor
    - **Metadata-Driven Caching**: Ensures parameter consistency across training runs
 
-## 📊 Current Performance
+##  Current Performance
 
 ### Model Performance Metrics
 - **PSNR**: 40.59 dB (exceeds 30 dB target for disaster monitoring)
@@ -65,16 +65,16 @@ Output: (Batch, 4, 4H, 4W)   # 4× super-resolved SAR imagery
 - **Rural Areas**: 41.12 dB PSNR, 0.6904 SSIM (excellent performance)
 - **Urban Areas**: 26.70 dB PSNR, 0.6202 SSIM (adequate for most applications)
 
-## 🚧 Current Status & Recent Progress
+##  Current Status & Recent Progress
 
-### ✅ Completed Milestones
+### Completed Milestones
 - [x] Complete data preprocessing pipeline with SNAP integration
 - [x] AC-Swin-UNet++ model implementation and training infrastructure
 - [x] TensorBoard integration with SAR-specific visualization
 - [x] Comprehensive evaluation framework with disaster monitoring metrics
 - [x] GPU-accelerated patch extraction and caching system
 
-### 🔄 Active Research: Phase Processing Stability (연구질문.md §3)
+###  Active Research: Phase Processing Stability (연구질문.md §3)
 
 **Research Question**: "Complex network 위상 정보의 학습 불안정성을 어떻게 처리할 것인지?"
 
@@ -90,7 +90,7 @@ Output: (Batch, 4, 4H, 4W)   # 4× super-resolved SAR imagery
 - Magnitude-renormalized attention for complex-valued features
 - Comprehensive physical loss system addressing all research objectives
 
-### 🎯 Research Roadmap (연구질문.md-Driven)
+###  Research Roadmap (연구질문.md-Driven)
 - [ ] **Conditional SR**: Investigate DEM/LC conditioning for disaster-specific applications
 - [ ] **Alternative Activations**: Experiment with ComplexLeakyReLU vs ComplexGELU for phase preservation
 - [ ] **Disaster Task Specialization**: Focus on landslide vs ground subsidence applications
@@ -136,7 +136,7 @@ python workflows/SR_apply.py --input-dir data/patches/LR --output-dir results/SR
 
 See [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) for detailed directory organization and file conventions.
 
-## 🔬 Technical Details
+##  Technical Details
 
 ### Data Specifications
 - **Preprocessing**: SNAP-processed with `final.xml` graph (orbit correction, calibration, TOPSAR processing)
@@ -163,43 +163,6 @@ See [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) for detailed directory organiza
 - **Complex U-Net**: Baseline comparison model
 - **Legacy Models**: Previous iterations preserved for comparison
 
-## 📈 Performance Analysis
-
-### Strengths
-- Excellent amplitude reconstruction with high PSNR values
-- Well-preserved cross-polarization coherence for multi-pol analysis
-- Effective speckle reduction while maintaining structural details
-- Strong performance in rural/agricultural areas
-
-### Areas for Improvement
-- **Phase Reconstruction**: Higher phase RMSE may impact interferometric applications
-- **Urban Performance**: Lower performance in dense urban environments
-- **Artifact Issues**: Ongoing work to eliminate checkerboard artifacts
-- **Texture Preservation**: Some over-smoothing in high-texture regions
-
-### Disaster Monitoring Suitability
-- **Flood Mapping**: Good performance for water boundary detection
-- **Landslide Detection**: Adequate for major terrain changes
-- **Agricultural Monitoring**: Excellent for crop damage assessment
-- **Infrastructure Assessment**: Good for major structural damage evaluation
-
-## 🤝 Development Workflow
-
-### Code Organization
-- **model/**: Core deep learning implementation and training
-- **workflows/**: Data processing and application scripts
-- **data/**: SAR datasets and preprocessing configurations
-- **results/**: Model outputs and performance analysis
-
-### Quality Assurance
-- Comprehensive unit testing for data processing pipeline
-- Automated performance regression testing
-- TensorBoard integration for training monitoring
-- Version-controlled model checkpoints with performance metadata
-
-## 📚 References & Acknowledgments
-
-This project builds upon state-of-the-art research in SAR image processing and deep learning super-resolution, specifically adapted for Korean disaster monitoring requirements.
 
 ### Key Technologies
 - **Sentinel-1 SAR**: European Space Agency radar satellite constellation
